@@ -2,6 +2,7 @@ import { FINAL_TOOL_PROMPT } from '../utils/textUtils.js'
 import { convertToolMessagesForChat } from '../utils/api/chatMessageAdapters.js'
 import { wireClone, freezeWire, tokenEstimate } from './promptCache.js'
 import { validateToolRows } from './contextStore.js'
+import { stripTurnReferenceContent } from './prompts.js'
 
 const requestContexts = new WeakMap()
 
@@ -16,7 +17,7 @@ export function bindCacheRequest(request, turn) {
 export function cacheRequestContext(request) { return requestContexts.get(request) }
 
 export class CacheTurn {
-  constructor({ turnId, scope, snapshot, observers, userRow, represented, settings, messageId }) {
+  constructor({ turnId, scope, snapshot, observers, userRow, referenceContent, represented, settings, messageId }) {
     this.turnId = turnId
     this.scope = scope
     this.snapshot = snapshot
@@ -26,6 +27,9 @@ export class CacheTurn {
     this.observers = observers
     this.represented = represented
     this.userRow = freezeWire(wireClone(userRow))
+    this.historyUserRow = freezeWire(wireClone({
+      ...userRow, content: stripTurnReferenceContent(userRow.content, referenceContent)
+    }))
     const newRows = observers.flatMap(item => item.block.toolRows)
     this.toolBase = freezeWire([
       { role: 'system', content: this.header.toolSystem },
@@ -75,12 +79,12 @@ export class CacheTurn {
 
   block() {
     this.chatMessages()
-    const base = [this.userRow]
+    const base = [this.historyUserRow]
     const reply = this.finalReply ? [this.finalReply] : []
     const toolRows = [...base, ...this.toolTail, ...reply]
     const chatReply = this.finalReply ? [{ ...this.finalReply, ...(this.finalReasoning ? { reasoning_content: this.finalReasoning } : {}) }] : []
     const chatRows = [...base, ...this.chatTail, ...chatReply]
     validateToolRows(toolRows)
-    return { turnId: this.turnId, toolRows, chatRows, messageIds: [this.messageId].filter(Boolean), tokens: Math.max(tokenEstimate(toolRows), tokenEstimate(chatRows)) }
+    return { turnId: this.turnId, referenceVersion: 2, toolRows, chatRows, messageIds: [this.messageId].filter(Boolean), tokens: Math.max(tokenEstimate(toolRows), tokenEstimate(chatRows)) }
   }
 }

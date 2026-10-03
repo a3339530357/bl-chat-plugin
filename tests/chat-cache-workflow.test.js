@@ -127,7 +127,7 @@ async function workflow({ enabled = true, currentMode = 'text', message = 'hello
   return { owner, e, replies, session: sessions[0], group }
 }
 
-test('actual handleTool text workflow commits full dynamic snapshot and records reply once', async () => {
+test('actual handleTool sends a full dynamic snapshot but commits only body and reply', async () => {
   const result = await workflow()
   assert.deepEqual(result.replies, ['OK'])
   assert.ok(result.session.cacheTurn)
@@ -136,6 +136,14 @@ test('actual handleTool text workflow commits full dynamic snapshot and records 
   for (const expected of ['current mood', 'user memory', 'group memory', 'current style', 'reference knowledge', 'current notice', '北京时间']) assert.ok(user.includes(expected), expected)
   assert.equal(requests[0].messages[0].content.includes('current mood'), false)
   const snapshot = await contextStore.read(result.session.cacheTurn.scope, result.session.cacheTurn.header, result.session.cacheTurn.settings)
+  const block = snapshot.blocks.at(-1)
+  assert.equal(block.toolRows[0].content, result.session.cacheTurn.historyUserRow.content)
+  assert.equal(block.chatRows[0].content, result.session.cacheTurn.historyUserRow.content)
+  for (const expected of ['current mood', 'user memory', 'group memory', 'current style', 'reference knowledge', 'current notice', '本轮参考资料']) {
+    assert.equal(block.toolRows[0].content.includes(expected), false, expected)
+    assert.equal(block.chatRows[0].content.includes(expected), false, expected)
+  }
+  for (const request of requests) assert.ok(request.messages.some(row => row.content?.includes('current mood')))
   assert.equal(snapshot.blocks.at(-1).toolRows.at(-1).role, 'assistant')
   assert.ok(snapshot.cursor > 0)
 })

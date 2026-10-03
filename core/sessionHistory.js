@@ -69,7 +69,7 @@ export const sessionHistoryMethods = {
     })
     const turn = new CacheTurn({
       turnId: session.turnId, scope, snapshot, observers, represented, settings, messageId: e.message_id,
-      userRow: { role: 'user', content: userContent + referenceContent }
+      userRow: { role: 'user', content: userContent + referenceContent }, referenceContent
     })
     if (Math.max(tokenEstimate(turn.toolBase) + tokenEstimate(snapshot.header.tools), tokenEstimate(turn.chatBase)) + settings.reserveTokens > settings.highWater) {
       throw new ContextStoreError('incoming_overflow')

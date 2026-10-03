@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { beijingDay, tokenEstimate, replayEventRow } from './promptCache.js'
+import { stripHistoricalTurnReferences } from './prompts.js'
 
 // Keep message/header JSON as strings in Lua: cjson round-trips [] as {}.
 
@@ -36,6 +37,24 @@ redis.call('HSET', KEYS[5], 'eventIndexCount', redis.call('HLEN', KEYS[4]))
 redis.call('HINCRBY', KEYS[5], 'rawBytes', string.len(encoded))
 ${EXPIRE}
 return cjson.encode({seq=seq})`
+
+const REFERENCE_HISTORY = `${GUARD}
+local count = redis.call('LLEN', KEYS[6])
+if tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1') == count then return cjson.encode({blocks={}}) end
+return cjson.encode({blocks=redis.call('LRANGE', KEYS[6], 0, -1)})`
+
+const CLEAN_REFERENCES = `${GUARD}
+local blocks = cjson.decode(ARGV[4])
+for index, block in ipairs(blocks) do
+  local current = redis.call('LINDEX', KEYS[6], index-1)
+  if current ~= block.before and current ~= block.after then return cjson.encode({retry=true}) end
+end
+for index, block in ipairs(blocks) do
+  if block.before ~= block.after then redis.call('LSET', KEYS[6], index-1, block.after) end
+end
+redis.call('HSET', KEYS[5], 'referenceCleanCount', #blocks)
+${EXPIRE}
+return cjson.encode({cleaned=true})`
 
 const READ = `${GUARD}
 local sourceError = redis.call('HGET', KEYS[5], 'sourceError')
@@ -86,6 +105,8 @@ if total > tonumber(ARGV[5]) then
   end
   if dropped > 0 then redis.call('LTRIM', KEYS[6], dropped, -1) end
   redis.call('HSET', KEYS[5], 'replayCount', redis.call('LLEN', KEYS[6]))
+  local cleanCount = tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1')
+  redis.call('HSET', KEYS[5], 'referenceCleanCount', cleanCount == #blocks and (#blocks-dropped) or -1)
 end
 local kept = {}
 for index=dropped+1,#blocks do table.insert(kept, blocks[index]) end
@@ -101,6 +122,8 @@ local untilSeq = tonumber(ARGV[5])
 if untilSeq > tonumber(redis.call('GET', KEYS[2]) or '0') then return cjson.encode({error='source_gap'}) end
 local candidates = cjson.decode(ARGV[6])
 local turn = cjson.decode(ARGV[7])
+local replayCount = redis.call('LLEN', KEYS[6])
+local referencesClean = tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1') == replayCount
 local incoming = {}
 for _, candidate in ipairs(candidates) do
   if redis.call('HEXISTS', KEYS[7], candidate.eventId) == 0 then table.insert(incoming, candidate) end
@@ -114,6 +137,7 @@ local represented = cjson.decode(ARGV[8])
 for _, id in ipairs(represented) do redis.call('HSET', KEYS[7], id, '1') end
 redis.call('HSET', KEYS[5], 'cursor', math.max(cursor, untilSeq))
 redis.call('HSET', KEYS[5], 'replayCount', redis.call('LLEN', KEYS[6]), 'representedCount', redis.call('HLEN', KEYS[7]))
+if referencesClean and turn.referenceVersion == 2 then redis.call('HSET', KEYS[5], 'referenceCleanCount', redis.call('LLEN', KEYS[6])) end
 redis.call('HSET', KEYS[8], ARGV[4], '1')
 ${EXPIRE}
 return cjson.encode({cursor=math.max(cursor, untilSeq), concurrentMerge=cursor~=tonumber(ARGV[9])})`
@@ -181,6 +205,7 @@ export class ContextStore {
   }
 
   async read(scope, header, settings, incomingTokens = 0, currentOrigin = '') {
+    await this.cleanHistoricalReferences(scope)
     const result = await this.evaluate(READ, this.keys(scope).slice(0, 7), [
       ...this.args(scope), JSON.stringify(header), settings.highWater, settings.lowWater,
       incomingTokens + settings.reserveTokens, currentOrigin, header.reliable === false ? '0' : '1'
@@ -191,6 +216,23 @@ export class ContextStore {
     result.blocks = Array.isArray(result.blocks) ? result.blocks.map(block => JSON.parse(block)) : []
     result.header = JSON.parse(result.header)
     return result
+  }
+
+  async cleanHistoricalReferences(scope) {
+    // One-time legacy format migration, before capacity accounting can trim inflated blocks.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const snapshot = await this.evaluate(REFERENCE_HISTORY, this.keys(scope).slice(0, 6), this.args(scope))
+      if (!Array.isArray(snapshot.blocks)) return
+      const blocks = snapshot.blocks.map(before => {
+        const block = JSON.parse(before)
+        const cleaned = stripHistoricalTurnReferences(block)
+        if (cleaned !== block) cleaned.tokens = Math.max(tokenEstimate(cleaned.toolRows), tokenEstimate(cleaned.chatRows))
+        return { before, after: cleaned === block ? before : JSON.stringify(cleaned) }
+      })
+      const result = await this.evaluate(CLEAN_REFERENCES, this.keys(scope).slice(0, 6), [...this.args(scope), JSON.stringify(blocks)])
+      if (!result.retry) return
+    }
+    throw new ContextStoreError('reference_migration_conflict')
   }
 
   async commit(scope, { turnId, readUntil, baseCursor, observers, block, represented = [] }) {

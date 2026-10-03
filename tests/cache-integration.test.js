@@ -5,7 +5,7 @@ import { once } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import { ContextStore } from '../core/contextStore.js'
 import { sessionHistoryMethods } from '../core/sessionHistory.js'
-import { buildPromptCacheHeaders } from '../core/prompts.js'
+import { buildPromptCacheHeaders, TURN_REFERENCE_START } from '../core/prompts.js'
 import { bindCacheRequest } from '../core/cacheTurn.js'
 import { originKeyForEvent, freezeWire } from '../core/promptCache.js'
 import { redisFixture } from './helpers/redis-fixture.js'
@@ -85,7 +85,7 @@ async function context() {
   return { store, scope, config, header, owner, states, manager, makeEvent, prepare, request }
 }
 
-test('real Redis + captured HTTP preserve each stage prefix across turns and keep metadata off wire', async () => {
+test('real Redis + HTTP preserve clean history and tool bytes while references remain current-turn only', async () => {
   requests.length = 0
   toolCalls = 0
   const ctx = await context()
@@ -125,8 +125,13 @@ test('real Redis + captured HTTP preserve each stage prefix across turns and kee
   ctx.states.set('observer', { text: 'tool_success' })
   const second = await ctx.prepare(ctx.makeEvent('current-two', 'user-two'), { emotion: 'sad', memory: 'user-two likes books', time: 'second time' })
   assert.equal(first.userRow.content, firstUserBytes)
-  assert.deepEqual(second.toolBase.slice(0, toolRequest.messages.length), toolRequest.messages)
-  assert.deepEqual(second.chatBase.slice(0, chatRequest.messages.length), chatRequest.messages)
+  const storedToolRequest = toolRequest.messages.map((row, index) => index === first.toolBase.length - 1 ? first.historyUserRow : row)
+  const storedChatRequest = chatRequest.messages.map((row, index) => index === first.chatBase.length - 1 ? first.historyUserRow : row)
+  assert.deepEqual(second.toolBase.slice(0, first.toolBase.length - 1), toolRequest.messages.slice(0, first.toolBase.length - 1))
+  assert.deepEqual(second.toolBase.slice(0, storedToolRequest.length), storedToolRequest)
+  assert.deepEqual(second.chatBase.slice(0, storedChatRequest.length), storedChatRequest)
+  assert.equal(second.toolBase.some(row => row.content?.includes('user-one likes music')), false)
+  assert.equal(second.chatBase.some(row => row.content?.includes('first time')), false)
   assert.equal(second.chatBase.find(row => row.content === 'reply').reasoning_content, 'exact final reasoning bytes')
   assert.equal(second.toolBase.find(row => row.content === 'reply').reasoning_content, undefined)
   assert.ok(second.userRow.content.includes('tool_success'))
@@ -136,7 +141,32 @@ test('real Redis + captured HTTP preserve each stage prefix across turns and kee
   await YTapi(ctx.request(second, [...second.toolBase], 'none'), ctx.config)
   assert.equal(requests.at(-2).tool_choice, 'none')
   assert.deepEqual(requests.at(-2).tools, [declaration])
-  assert.deepEqual(second.chatBase.slice(0, chatRequest.messages.length), chatRequest.messages)
+  assert.deepEqual(second.chatBase.slice(0, storedChatRequest.length), storedChatRequest)
+})
+
+test('six committed turns replay only body text and keep exactly one current reference in each request stage', async () => {
+  const ctx = await context()
+  let previousHistory = []
+  for (let index = 0; index < 6; index++) {
+    const content = `full user body ${index}\nquoted text\n[image https://example.test/${index}.png]`
+    const turn = await ctx.prepare(ctx.makeEvent(`ephemeral-${index}`), { memory: `snapshot-${index} ${'large memory '.repeat(400)}` }, content)
+    assert.equal(turn.historyUserRow.content, content)
+    assert.ok(Object.isFrozen(turn.historyUserRow))
+    assert.ok(Object.isFrozen(turn.userRow))
+    for (const messages of [turn.toolBase, turn.chatMessages()]) {
+      assert.equal(messages.filter(row => row.content?.includes(TURN_REFERENCE_START)).length, 1)
+      assert.ok(messages.at(-1).content.includes(`snapshot-${index}`))
+      assert.deepEqual(messages.slice(1, 1 + previousHistory.length), previousHistory)
+    }
+    turn.finalReply = freezeWire({ role: 'assistant', content: `reply-${index}` })
+    await ctx.owner.commitPromptCacheTurn({ cacheTurn: turn }, {})
+    const snapshot = await ctx.store.read(ctx.scope, ctx.header, turn.settings)
+    for (const block of snapshot.blocks) {
+      for (const row of [...block.toolRows, ...block.chatRows]) assert.equal(row.content?.includes(TURN_REFERENCE_START), false)
+    }
+    previousHistory = snapshot.blocks.flatMap(block => block.toolRows)
+    assert.ok(JSON.stringify(snapshot.blocks).length < turn.userRow.content.length)
+  }
 })
 
 test('terminal tool path persists complete native protocol without another model request', async () => {

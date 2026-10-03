@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { ContextStore, validateToolRows } from '../core/contextStore.js'
 import { promptCacheSettings, beijingDay, isPromptCacheEnabled, originKeyForEvent, tokenEstimate } from '../core/promptCache.js'
-import { buildPromptCacheHeaders } from '../core/prompts.js'
+import { buildPromptCacheHeaders, buildTurnReferenceContent, TURN_REFERENCE_START, TURN_REFERENCE_END } from '../core/prompts.js'
 import { sessionHistoryMethods } from '../core/sessionHistory.js'
 import { redisFixture } from './helpers/redis-fixture.js'
 
@@ -176,4 +176,52 @@ test('overflowing new content does not destroy an existing replay prefix', async
   await assert.rejects(store.read(scope, header, { ...settings, highWater: 5000 }, 6000), { code: 'incoming_overflow' })
   const snapshot = await store.read(scope, header, settings)
   assert.equal(snapshot.blocks[0].turnId, 'kept')
+})
+
+test('legacy references migrate before budget trimming without losing tool rows, replies, IDs or cursor', async () => {
+  const { store, scope } = await storeScope()
+  await store.record(scope, event('old'))
+  const reference = buildTurnReferenceContent({
+    turnId: 'old', userId: 'user', messageId: 'old', asOf: '2026-10-03T12:00:00.000Z',
+    references: { memory: 'obsolete memory '.repeat(4000) }, taskStatuses: [], allowedTools: ['probe']
+  })
+  const legacy = '\n\n' + reference.slice(TURN_REFERENCE_START.length, -TURN_REFERENCE_END.length)
+  const user = { role: 'user', content: 'full original user body\nimage URL' + legacy }
+  const call = { role: 'assistant', tool_calls: [{ id: 'original-call', type: 'function', function: { name: 'probe', arguments: ' { "x" : 1 } ' } }] }
+  const result = { role: 'tool', tool_call_id: 'original-call', content: 'exact result bytes' }
+  const reply = { role: 'assistant', content: 'reply', reasoning_content: 'original final reasoning' }
+  const old = { ...block('old'), toolRows: [user, call, result, reply], chatRows: [user, { role: 'system', content: '[tool_execution]\nexact result bytes' }, reply], tokens: 20000 }
+  await store.commit(scope, { turnId: 'old', readUntil: 1, baseCursor: 0, observers: [], block: old, represented: ['old'] })
+  const snapshots = await Promise.all(Array.from({ length: 3 }, () => store.read(scope, header, { ...settings, highWater: 5000, lowWater: 2500, reserveTokens: 0 })))
+  for (const snapshot of snapshots) {
+    assert.equal(snapshot.dropped, 0)
+    assert.equal(snapshot.cursor, 1)
+    assert.equal(snapshot.blocks.length, 1)
+    const cleaned = snapshot.blocks[0]
+    assert.equal(cleaned.toolRows[0].content, 'full original user body\nimage URL')
+    assert.equal(cleaned.chatRows[0].content, cleaned.toolRows[0].content)
+    assert.deepEqual(cleaned.toolRows.slice(1), old.toolRows.slice(1))
+    assert.deepEqual(cleaned.chatRows.slice(1), old.chatRows.slice(1))
+    assert.deepEqual(cleaned.messageIds, ['old'])
+    assert.equal(cleaned.referenceVersion, 2)
+    assert.equal(cleaned.tokens, Math.max(tokenEstimate(cleaned.toolRows), tokenEstimate(cleaned.chatRows)))
+  }
+  const stored = await fixture.client.command('LRANGE', store.keys(scope)[5], 0, -1)
+  assert.deepEqual(JSON.parse(stored[0]), snapshots[0].blocks[0])
+  await store.commit(scope, { turnId: 'old', readUntil: 1, baseCursor: 0, observers: [], block: old })
+  assert.deepEqual((await store.read(scope, header, settings)).blocks, snapshots[0].blocks)
+})
+
+test('legacy writes after cleanup are detected and migrated on the next read', async () => {
+  const { store, scope } = await storeScope()
+  const makeLegacy = id => {
+    const reference = buildTurnReferenceContent({ turnId: id, userId: 'user', messageId: id, asOf: '2026-10-03T12:00:00.000Z', references: {}, taskStatuses: [], allowedTools: [] })
+    const row = { role: 'user', content: id + '\n\n' + reference.slice(TURN_REFERENCE_START.length, -TURN_REFERENCE_END.length) }
+    return { ...block(id), toolRows: [row], chatRows: [row] }
+  }
+  for (const id of ['old-one', 'old-two']) {
+    await store.commit(scope, { turnId: id, readUntil: 0, baseCursor: 0, observers: [], block: makeLegacy(id) })
+    const snapshot = await store.read(scope, header, settings)
+    assert.ok(snapshot.blocks.every(item => item.toolRows[0].content === item.turnId))
+  }
 })

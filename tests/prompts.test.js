@@ -1,6 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { buildChatSystemPrompt } from "../core/prompts.js"
+import {
+  buildChatSystemPrompt, buildPromptCacheHeaders, buildTurnReferenceContent,
+  stripTurnReferenceContent, stripHistoricalTurnReferences, TURN_REFERENCE_START, TURN_REFERENCE_END
+} from "../core/prompts.js"
 
 const baseParams = {
   systemContent: "你是测试人设",
@@ -55,4 +58,57 @@ test("buildChatSystemPrompt：工具历史段可选且位于消息记录段之�
 test("buildChatSystemPrompt：以群聊消息记录段结尾", () => {
   const prompt = buildChatSystemPrompt(baseParams)
   assert.ok(prompt.endsWith("【群聊消息记录】\n"))
+})
+
+const referenceOptions = {
+  turnId: 'turn-one', userId: '42', messageId: 'message-one', asOf: '2026-10-03T12:00:00.000Z',
+  references: { time: 'current time', memory: 'current memory' }, taskStatuses: ['current processing'], allowedTools: ['probe']
+}
+
+test('turn reference anchors delimit all current data and strip exactly the generated suffix', () => {
+  const reference = buildTurnReferenceContent(referenceOptions)
+  assert.ok(reference.startsWith(TURN_REFERENCE_START))
+  assert.ok(reference.endsWith(TURN_REFERENCE_END))
+  for (const value of ['current time', 'current memory', 'current processing', 'message-one', '42', 'probe']) assert.ok(reference.includes(value))
+  const body = 'quoted message and https://example.test/image.png\n\n'
+  assert.equal(stripTurnReferenceContent(body + reference, reference), body)
+  assert.equal(stripTurnReferenceContent(body, reference), body)
+  assert.equal(stripTurnReferenceContent(body, ''), body)
+  assert.equal(stripTurnReferenceContent(body + reference, reference.slice(0, -TURN_REFERENCE_END.length)), body + reference)
+  assert.equal(stripTurnReferenceContent(body + reference + '\nuser text', reference), body + reference + '\nuser text')
+})
+
+test('reference stripping preserves literal anchors in user input and nested markers in RAG', () => {
+  const quoted = buildTurnReferenceContent({ ...referenceOptions, turnId: 'quoted' })
+  const body = `literal ${TURN_REFERENCE_START} text ${TURN_REFERENCE_END}\n${quoted}`
+  const reference = buildTurnReferenceContent({ ...referenceOptions, references: { memory: `data ${TURN_REFERENCE_START} inner ${TURN_REFERENCE_END}` } })
+  assert.equal(stripTurnReferenceContent(body + reference, reference), body)
+})
+
+test('legacy cleanup requires matching turn/message metadata and complete generated footer', () => {
+  const reference = buildTurnReferenceContent(referenceOptions)
+  const legacy = '\n\n' + reference.slice(TURN_REFERENCE_START.length, -TURN_REFERENCE_END.length)
+  const body = 'a pasted 【本轮参考资料】 title stays in user text'
+  const row = { role: 'user', content: body + legacy }
+  const reply = { role: 'assistant', content: 'reply', reasoning_content: 'retained reasoning' }
+  const block = { turnId: 'turn-one', messageIds: ['message-one'], toolRows: [row, reply], chatRows: [row, reply] }
+  const cleaned = stripHistoricalTurnReferences(block)
+  assert.equal(cleaned.toolRows[0].content, body)
+  assert.equal(cleaned.chatRows[0].content, body)
+  assert.deepEqual(cleaned.toolRows[1], reply)
+  assert.equal(block.toolRows[0].content, body + legacy)
+  assert.equal(stripHistoricalTurnReferences(cleaned), cleaned)
+  for (const other of [
+    { ...block, turnId: 'foreign' }, { ...block, messageIds: ['foreign'] },
+    { ...block, toolRows: [{ ...row, content: row.content + ' added user text' }], chatRows: [] },
+    { ...block, toolRows: [{ ...row, content: row.content.replace('"asOf": "2026-10-03T12:00:00.000Z"', '"asOf": "invalid"') }], chatRows: [] }
+  ]) assert.equal(stripHistoricalTurnReferences(other), other)
+})
+
+test('only V2 system rules declare reference snapshots ephemeral', () => {
+  const header = buildPromptCacheHeaders(baseParams, [])
+  assert.ok(header.toolSystem.includes('本轮参考资料不进入历史回放'))
+  assert.ok(header.chatSystem.includes('本轮参考资料不进入历史回放'))
+  assert.ok(!header.toolSystem.includes('历史快照和工具收尾提示'))
+  assert.ok(!buildChatSystemPrompt(baseParams).includes('本轮参考资料不进入历史回放'))
 })
