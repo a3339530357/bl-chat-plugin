@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { messageBuilderMethods } from "../core/messageBuilder.js"
+import { messageBuilderMethods, formatReplayEventRow } from "../core/messageBuilder.js"
 
 const clean = text => messageBuilderMethods.processToolSpecificMessage(text, "anyTool")
 
@@ -36,4 +36,15 @@ test("processToolSpecificMessage：无时间戳的记录前缀残留时提取正
 
 test("processToolSpecificMessage：剥离开头的 说: 前缀", () => {
   assert.equal(clean("说: 你好"), "你好")
+})
+
+test('V2 ordinary assistant history clips once while source and user content remain intact', () => {
+  const original = { time: '2026-10-03 12:00:00', sender: { user_id: 'bot', nickname: 'Bot' }, content: 'x'.repeat(500) }
+  const bot = formatReplayEventRow(original, 'bot')
+  assert.equal(bot.role, 'assistant')
+  assert.ok(bot.content.endsWith('...'))
+  assert.equal(original.content.length, 500)
+  const user = formatReplayEventRow({ ...original, sender: { user_id: 'user', nickname: 'User' } }, 'bot')
+  assert.ok(user.content.includes('x'.repeat(500)))
+  assert.equal(formatReplayEventRow({ ...original, content: '【系统提示】 internal' }, 'bot'), null)
 })

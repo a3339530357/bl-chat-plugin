@@ -3,10 +3,28 @@ const { axios, moment } = dependencies;
 import schedule from 'node-schedule';
 import { refreshTencentImageUrl } from './fileUtils.js';
 import { scanRedisKeys, deleteRedisKeys } from './redisScan.js';
+import { contextStore } from '../core/contextStore.js';
+import { botIdForEvent, originKeyForEvent, isPromptCacheEnabled, promptCacheSettings, wireClone, beijingDay } from '../core/promptCache.js';
 
 // 同 key 写队列（模块级：本类会被多处 new，含 Yunzai 每条消息实例化的插件，
 // 实例级锁跨实例不生效）。串行化 读-改-写，避免并发记录互相覆盖丢消息。
 const writeQueues = new Map();
+let v2MessageManager = null;
+
+export function getV2MessageManager(config, { update = true } = {}) {
+  v2MessageManager ||= new MessageManager({ privateMaxMessages: 100, messageMaxLength: 9999 });
+  if (!config || !update && v2MessageManager.promptCacheConfig) return v2MessageManager;
+  const selector = JSON.stringify([config.promptCache?.enabled, config.promptCache?.groups, config.enabled, config.groupHistory, config.useTools,
+    config.chatAiConfig?.chatApiUrl, config.toolsAiConfig?.toolsAiUrl]);
+  if (v2MessageManager.journalSelector !== selector) {
+    v2MessageManager.syncedScopes = new Set();
+    v2MessageManager.journalSelector = selector;
+  }
+  v2MessageManager.GROUP_MAX_MESSAGES = config.groupMaxMessages || 100;
+  v2MessageManager.CACHE_EXPIRE_DAYS = config.groupChatMemoryDays || 1;
+  v2MessageManager.promptCacheConfig = config;
+  return v2MessageManager;
+}
 
 export class MessageManager {
   /**
@@ -218,7 +236,7 @@ export class MessageManager {
  * @param {Object} message 消息对象
  * @returns {Promise<string>} 格式化后的消息内容
  */
-  async formatMessageContent(message) {
+  async formatMessageContent(message, maxLength = this.MESSAGE_MAX_LENGTH) {
     const isGroup = message.message_type === 'group';
     let content = '';
     let totalLength = 0;
@@ -291,8 +309,8 @@ export class MessageManager {
         const separatorLength = content.length > 0 ? 1 : 0;
 
         // 修改：如果超出最大长度，截断而不是直接变成 ...
-        if (totalLength + separatorLength + actionLength > this.MESSAGE_MAX_LENGTH) {
-          const remainingLength = this.MESSAGE_MAX_LENGTH - totalLength - separatorLength - 3; // 3 是 "..." 的长度
+        if (totalLength + separatorLength + actionLength > maxLength) {
+          const remainingLength = maxLength - totalLength - separatorLength - 3; // 3 是 "..." 的长度
 
           if (remainingLength > 10) {
             // 还有足够空间，截断当前消息
@@ -302,7 +320,7 @@ export class MessageManager {
             content += action.substring(0, remainingLength) + '...';
           } else if (content.length === 0) {
             // 第一条消息就超长，直接截断
-            content = action.substring(0, this.MESSAGE_MAX_LENGTH - 3) + '...';
+            content = action.substring(0, maxLength - 3) + '...';
           } else {
             content += '...';
           }
@@ -333,8 +351,8 @@ export class MessageManager {
         action = action.replace(urlPart, '');
       }
 
-      if (action.length > this.MESSAGE_MAX_LENGTH) {
-        content = action.substring(0, this.MESSAGE_MAX_LENGTH - 3) + '...';
+      if (action.length > maxLength) {
+        content = action.substring(0, maxLength - 3) + '...';
       } else {
         content = action;
       }
@@ -353,9 +371,9 @@ export class MessageManager {
    * @param {Object} message 消息对象
    * @returns {Promise<Object>} 格式化后的消息对象
    */
-  async formatMessage(message) {
+  async formatMessage(message, maxLength = this.MESSAGE_MAX_LENGTH, content = undefined) {
     const isGroup = message.message_type === 'group';
-    const isBot = message.sender.user_id === Bot.uin;
+    const isBot = String(message.sender.user_id) === String(Bot.uin);
 
     return {
       time: moment(message.time * 1000).format('YYYY-MM-DD HH:mm:ss'),
@@ -367,7 +385,7 @@ export class MessageManager {
         level: message.sender.level,
         identity: isBot ? '[Bot]' : this.getSenderTitle(message.sender, isGroup)  // 为 bot 添加标识
       },
-      content: await this.formatMessageContent(message),
+      content: content === undefined ? await this.formatMessageContent(message, maxLength) : content,
       message_id: message.message_id,
       message_type: message.message_type,
       source: message.source || null,
@@ -407,10 +425,22 @@ export class MessageManager {
     const id = isGroup ? e.group_id : e.sender.user_id;
     const type = isGroup ? 'group' : 'private';
     const redisKey = this.getRedisKey(type, id);
+    const config = options.promptCacheConfig || this.promptCacheConfig;
+    const store = options.contextStore || contextStore;
+    const journalScope = isGroup && isPromptCacheEnabled(config, id)
+      ? options.scope || store.scope(botIdForEvent(e), id) : null;
+    // Attach a rejection handler immediately while an earlier write is queued.
+    journalScope?.catch?.(() => {});
+    const context = { isGroup, type, id, redisKey, journalScope, journalConfig: config, store };
+
+    if (options.journalOnly) {
+      if (!journalScope) return null;
+      return (await this.recordJournal(e, options, context)).source;
+    }
 
     // 排队写：等同 key 的上一次写完成后再执行本次 读-改-写
     const prev = writeQueues.get(redisKey) || Promise.resolve();
-    const task = prev.then(() => this.doRecordMessage(e, options, { isGroup, type, id, redisKey }))
+    const task = prev.then(() => this.doRecordMessage(e, options, context))
       .catch(error => {
         logger.error(`记录消息失败: ${error}`);
       });
@@ -421,9 +451,53 @@ export class MessageManager {
     return task;
   }
 
-  async doRecordMessage(e, options, { isGroup, type, id, redisKey }) {
+  async recordJournal(e, options, context) {
+    const { type, id, journalScope, journalConfig, store } = context;
+    const scope = await journalScope;
+    const eventId = originKeyForEvent(e);
+    const found = await store.lookup(scope, eventId);
+    const syncKey = `${scope.root}r:${scope.resetId}`;
+    this.syncedScopes ||= new Set();
+    if (this.syncDay !== scope.dayKey) { this.syncedScopes.clear(); this.syncDay = scope.dayKey; }
+    if (found.latest === 0 || !this.syncedScopes.has(syncKey)) {
+      const seed = await this.getMessages(type, id, { strict: true });
+      for (const message of [...seed].reverse()) {
+        const received = message.received_at ?? moment(message.time, 'YYYY-MM-DD HH:mm:ss').valueOf();
+        if (!Number.isFinite(received) || beijingDay(received).dayKey !== scope.dayKey) continue;
+        const origin = message.origin_key || (message.message_id !== undefined && message.message_id !== null
+          ? `message:${scope.botId}:${id}:${message.message_id}` : `seed:${scope.resetId}:${message.time}:${message.sender?.user_id}:${seed.indexOf(message)}`);
+        await store.record(scope, { eventId: origin, message }, promptCacheSettings(journalConfig));
+      }
+      this.syncedScopes.add(syncKey);
+    }
+    const known = options.journalOnly ? await store.lookup(scope, eventId) : found;
+    if (options.journalOnly && known.seq) return { source: { scope, seq: known.seq, eventId } };
+
+    // The current API user content is already resolved; this path must not fetch media again.
+    const content = options.journalOnly ? options.journalContent ?? e.msg ?? e.raw_message ?? JSON.stringify(e.message || []) : undefined;
+    const formatted = await this.formatMessage(e, options.messageMaxLength ?? this.MESSAGE_MAX_LENGTH, content);
+    formatted.origin_key = eventId;
+    formatted.received_at = Date.now();
+    context.formatted = formatted;
+    const recorded = await store.record(scope, { eventId, message: wireClone(formatted) }, promptCacheSettings(journalConfig));
+    const source = { scope, seq: recorded.seq, eventId };
+    try { e._promptCacheSource = source; } catch {}
+    return { formatted, source };
+  }
+
+  async doRecordMessage(e, options, context) {
+    const { isGroup, type, id, redisKey, journalScope } = context;
+    let formatted;
+    if (journalScope) {
+      try {
+        ({ formatted } = await this.recordJournal(e, options, context));
+      } catch (error) {
+        formatted = context.formatted;
+        logger.warn?.(`[PromptCacheV2] source recording failed: ${error.code || error.message}`);
+      }
+    }
     let messages = await this.getMessages(type, id);
-    messages.unshift(await this.formatMessage(e)); // 在数组开头添加新消息
+    messages.unshift(formatted || await this.formatMessage(e, options.messageMaxLength ?? this.MESSAGE_MAX_LENGTH)); // 在数组开头添加新消息
 
     // 使用自定义群聊消息上限或默认值
     const maxMessages = isGroup
@@ -445,7 +519,7 @@ export class MessageManager {
    * @param {number} id 用户ID或群ID
    * @returns {Promise<Array>} 消息历史数组
    */
-  async getMessages(type, id) {
+  async getMessages(type, id, options = {}) {
     try {
       const redisKey = this.getRedisKey(type, id);
       const data = await redis.get(redisKey);
@@ -457,6 +531,7 @@ export class MessageManager {
         return timeB - timeA; // 倒序排列
       });
     } catch (error) {
+      if (options?.strict) throw error;
       logger.error(`获取消息历史失败: ${error}`);
       return [];
     }
@@ -468,9 +543,19 @@ export class MessageManager {
    * @param {number} id 用户ID或群ID
    * @returns {Promise<void>}
    */
-  async clearMessages(type, id) {
+  async clearMessages(type, id, options = {}) {
     try {
       const redisKey = this.getRedisKey(type, id);
+      if (type === 'group' && options.botId) {
+        const previous = writeQueues.get(redisKey) || Promise.resolve();
+        const task = previous.then(async () => {
+          await contextStore.reset(String(options.botId), id);
+          await redis.del(redisKey);
+        });
+        writeQueues.set(redisKey, task.catch(() => {}));
+        await task;
+        return;
+      }
       await redis.del(redisKey);
       logger.info(`已清除${type}:${id}的消息历史记录`);
     } catch (error) {

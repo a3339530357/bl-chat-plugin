@@ -6,6 +6,16 @@ import { sanitizeFinalReplyText } from "./pseudoToolSanitizer.js"
 
 export const roleMap = { owner: "owner", admin: "admin", member: "member" }
 
+export function formatReplayEventRow(event, botId) {
+  const message = event.message || event
+  const sender = message.sender || {}
+  if (String(message.content || '').startsWith('【系统提示】')) return null
+  const role = String(sender.user_id) === String(botId) ? 'assistant' : 'user'
+  let content = `[${message.time}] ${sender.nickname}(QQ号:${sender.user_id})[群身份: ${roleMap[sender.role] || 'member'}]${message.message_id ? `[消息ID:${message.message_id}]` : ''}: ${message.content || ''}`
+  if (role === 'assistant') content = `[Bot回复]: ${content.length > 200 ? `${content.substring(0, 200)}...` : content}`
+  return { role, content }
+}
+
 const groupContextCache = new Map()
 const GROUP_CONTEXT_CACHE_TTL_MS = 5 * 60 * 1000
 

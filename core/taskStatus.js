@@ -20,6 +20,16 @@ function setTaskStatusCache(key, record) {
 }
 
 export const taskStatusMethods = {
+  async getTaskStatusPromptSnapshot(groupId, messageIds, currentMessageId) {
+    const ids = [...new Set(messageIds.filter(id => id !== undefined && id !== null && String(id) !== String(currentMessageId)).map(String))]
+    const states = await Promise.all(ids.map(async id => {
+      const status = await this.getTaskStatus(groupId, id)
+      const text = this.formatTaskStatusForPrompt(status)
+      return text ? `[消息ID:${id}] ${text}` : null
+    }))
+    return states.filter(Boolean)
+  },
+
   getTaskStatusCacheKey(groupId, messageId) {
     return `${groupId}:${messageId}`
   }

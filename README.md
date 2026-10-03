@@ -1194,3 +1194,37 @@ embeddingApiKey: "sk-xxxxx"
 1. 工具调用想被动一些的话可以使用 gemini-2.5-flash，如果想主动一些例如主动发语音、主动贴表情等，可以使用gemini-3-flash-preview
 2. 对话模型实际测试下来还是gemini-2.5-pro综合性更好
 3. 对话追踪判断可以使用响应快并不需要思考的简单模型，例如gemini-2.0，gpt-4o-mini等
+
+### 群聊对话缓存 V2
+
+V2 默认关闭，`promptCache.groups` 为空时不对任何群生效。配置入口同时提供在 Guoba 面板，生产切换应按群灰度。
+
+```yaml
+promptCache:
+  enabled: false
+  groups: []
+  highWaterTokens: 65536
+  lowWaterTokens: 32768
+  reserveTokens: 8192
+  rawMaxEvents: 20000
+  rawMaxBytes: 33554432
+  diagnostics: true
+  preserveForcedSubsets: true
+  preserveFinalNoTools: true
+```
+
+群号以字符串填写；`*` 表示所有群。仅支持现有 OpenAI 兼容端点，Anthropic 路径和未选中的群保持 V1。`groupMaxMessages` 继续控制 V1 兼容窗口；V2 回放按 token 高低水位保留完整轮次。
+
+V2 保存按北京时间分日的原始事件序列，以及分别供工具决策和自然聊天使用的不可变回放。时间、记忆、情绪、RAG、画像、公告、MCP 提示和最新任务状态放在本轮 user 尾部。后续请求回放旧字节，同轮只追加工具结果；工具声明与执行白名单分开。
+
+Redis 提交按完整轮次原子追加，游标单调推进，turnId 防止保存重试重复入列。午夜与同日清理会使旧轮提交失效；`#清除群聊记录` 同时重置该群的 V2 世代。并发保留原有上限，但同时发出的请求可能发生分支汇合和缓存断点。
+
+已知限制：V2 清理以收到命令的当前机器人账号为范围；多账号同群部署时，不自动重置其他账号的回放。本部署为单 bot，跨账号清理需要另行定义其对进行中会话的影响。
+
+本次独立网关探测中，固定声明的 auto/named/none 切换保持缓存命中，但 none 未可靠禁止工具调用。因此强制场景默认保留原单工具子集，达到轮数上限时默认保留原空工具声明收尾；这两种兼容路径会记录缓存断点。关闭兼容开关前须重新验证部署网关的工具选择行为。
+
+高水位控制旧历史留存，不静默截断当前工具结果。超大新增批次、原始日志容量超限或存储异常会明确记录并回退 V1；旧媒体链接过期可通过清除群记录产生明确恢复断点。关闭 V2 开关即可回退，不把 V2 消息倒灌进旧文件，也不删除工具状态和长期记忆。
+
+诊断日志按每次实际 API 请求记录阶段、input/cached/output、耗时、实际模型和账号摘要。缓存请求比例与 token 缓存比例分别统计，不能把稳定的本地哈希当成上游命中，也不保证所有场景达到 90%。
+
+测试使用隔离的 Redis Unix socket 和 HTTP 模拟网关，需要本机有 `redis-server`、`redis-cli`；实际工作流测试使用 Node 模块钩子隔离 Yunzai 外部依赖。`npm test` 与 `npm run lint` 不连接生产 QQ 或生产 Redis。

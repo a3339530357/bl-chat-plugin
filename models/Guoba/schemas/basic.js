@@ -37,6 +37,23 @@ export default [
     componentProps: { min: 1, max: 20, placeholder: "3" }
   },
   {
+    field: 'promptCache.enabled', label: '对话缓存 V2', component: 'Switch',
+    bottomHelpMessage: '默认关闭，仅对下面列出的群生效'
+  },
+  {
+    field: 'promptCache.groups', label: 'V2 灰度群', component: 'GTags',
+    bottomHelpMessage: '填写群号；空列表不启用任何群，* 表示所有群',
+    componentProps: { allowAdd: true, allowDel: true }
+  },
+  { field: 'promptCache.highWaterTokens', label: 'V2 输入高水位', component: 'InputNumber', componentProps: { min: 4096, max: 524288 } },
+  { field: 'promptCache.lowWaterTokens', label: 'V2 历史低水位', component: 'InputNumber', componentProps: { min: 2048, max: 524288 } },
+  { field: 'promptCache.reserveTokens', label: 'V2 输出与工具预留', component: 'InputNumber', componentProps: { min: 1024, max: 65536 } },
+  { field: 'promptCache.rawMaxEvents', label: 'V2 当日消息源上限', component: 'InputNumber', componentProps: { min: 100, max: 200000 } },
+  { field: 'promptCache.rawMaxBytes', label: 'V2 消息源字节上限', component: 'InputNumber', componentProps: { min: 1048576, max: 536870912 } },
+  { field: 'promptCache.diagnostics', label: 'V2 缓存诊断日志', component: 'Switch' },
+  { field: 'promptCache.preserveForcedSubsets', label: '强制工具子集兼容', component: 'Switch', bottomHelpMessage: '保留视频、头像、导图、红包场景原有单工具声明，优先保证强制工具行为' },
+  { field: 'promptCache.preserveFinalNoTools', label: '末轮空工具兼容', component: 'Switch', bottomHelpMessage: '保留原空工具收尾，关闭前需验证网关 none 行为' },
+  {
     field: "segmentedReplyEnabled",
     label: "分段发送",
     component: "Switch",

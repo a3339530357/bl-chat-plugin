@@ -4,10 +4,114 @@
 import fs from "fs"
 import path from "path"
 import { loadData, saveData } from "../utils/redisClient.js"
+import { contextStore, ContextStoreError } from './contextStore.js'
+import { CacheTurn } from './cacheTurn.js'
+import { originKeyForEvent, promptCacheSettings, replayEventRow, tokenEstimate, cacheDiagnostic, beijingDay } from './promptCache.js'
+import { buildTurnReferenceContent } from './prompts.js'
+import { taskStatusMethods } from './taskStatus.js'
 
 const _path = process.cwd()
 
 export const sessionHistoryMethods = {
+  async preparePromptCacheTurn({ e, session, scope, header, userContent, references, manager, allowedTools, config = this.config }) {
+    const store = this.contextStore || contextStore
+    const settings = promptCacheSettings(config)
+    await manager.recordMessage(e, {
+      journalOnly: true, messageMaxLength: 200, promptCacheConfig: config,
+      contextStore: store, scope, journalContent: userContent
+    })
+    const origin = originKeyForEvent(e)
+    const asOf = new Date().toISOString()
+    const preliminary = buildTurnReferenceContent({
+      turnId: session.turnId, userId: e.user_id, messageId: e.message_id, asOf,
+      references, taskStatuses: [], allowedTools
+    })
+    const incomingTokens = Math.max(tokenEstimate(header.toolSystem) + tokenEstimate(header.tools), tokenEstimate(header.chatSystem)) +
+      tokenEstimate(userContent + preliminary)
+    const snapshot = await store.read(scope, header, settings, incomingTokens, origin)
+    if (snapshot.headerChanged) cacheDiagnostic(config, 'header_change', { groupId: scope.groupId })
+    if (snapshot.dropped) cacheDiagnostic(config, 'capacity_trim', { groupId: scope.groupId, blocks: snapshot.dropped })
+    const observers = []
+    const represented = [origin]
+    for (const event of snapshot.events) {
+      if (event.represented || event.eventId === origin) continue
+      const row = replayEventRow(event, scope.botId)
+      if (!row) { represented.push(event.eventId); continue }
+      observers.push({ eventId: event.eventId, block: {
+        toolRows: [row], chatRows: [row], tokens: tokenEstimate(row),
+        messageIds: [event.message?.message_id].filter(Boolean)
+      } })
+    }
+    const newObserverCount = observers.length
+    if (!snapshot.blocks.length) {
+      const primer = { role: 'user', content: `当前QQ群[${scope.groupId}]的群聊历史记录。` }
+      observers.unshift({ eventId: `primer:${scope.resetId}:${snapshot.cursor}:${snapshot.readUntil}`, block: {
+        toolRows: [primer], chatRows: [primer], tokens: tokenEstimate(primer), messageIds: []
+      } })
+    }
+    const messageIds = [...new Set([
+      ...snapshot.blocks.flatMap(block => block.messageIds || []),
+      ...snapshot.events.map(event => event.message?.message_id)
+    ].filter(id => id !== undefined && id !== null && String(id) !== String(e.message_id)).map(String))]
+    const taskStatuses = await taskStatusMethods.getTaskStatusPromptSnapshot.call(this, scope.groupId, messageIds, e.message_id)
+    const selected = this.filterChatByQQ([
+      ...observers.flatMap(observer => observer.block.toolRows), { role: 'user', content: userContent }
+    ], e.user_id)
+    if (selected.length !== observers.reduce((sum, observer) => sum + observer.block.toolRows.length, 0) + 1) {
+      cacheDiagnostic(config, 'qq_filter_bypassed', {
+        groupId: scope.groupId, turnId: session.turnId,
+        removed: observers.reduce((sum, observer) => sum + observer.block.toolRows.length, 0) + 1 - selected.length
+      })
+    }
+    const referenceContent = buildTurnReferenceContent({
+      turnId: session.turnId, userId: e.user_id, messageId: e.message_id, asOf,
+      references, taskStatuses, allowedTools, newObserverCount
+    })
+    const turn = new CacheTurn({
+      turnId: session.turnId, scope, snapshot, observers, represented, settings, messageId: e.message_id,
+      userRow: { role: 'user', content: userContent + referenceContent }
+    })
+    if (Math.max(tokenEstimate(turn.toolBase) + tokenEstimate(snapshot.header.tools), tokenEstimate(turn.chatBase)) + settings.reserveTokens > settings.highWater) {
+      throw new ContextStoreError('incoming_overflow')
+    }
+    return turn
+  },
+
+  async commitPromptCacheTurn(session, e) {
+    const turn = session?.cacheTurn
+    if (!turn) return
+    const ids = e?._promptCacheDeliveryIds || []
+    const represented = [...turn.represented, ...ids.map(id => `message:${turn.scope.botId}:${turn.scope.groupId}:${id}`)]
+    const store = this.contextStore || contextStore
+    const payload = {
+      turnId: turn.turnId, readUntil: turn.snapshot.readUntil, baseCursor: turn.snapshot.cursor,
+      observers: turn.observers, represented, block: turn.block()
+    }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const result = await store.commit(turn.scope, payload)
+        if (result.concurrentMerge) cacheDiagnostic(this.config, 'concurrent_merge', { groupId: turn.scope.groupId, turnId: turn.turnId })
+        return result
+      } catch (error) {
+        if (error.code || attempt === 1) {
+          cacheDiagnostic(this.config, 'commit_rejected', { groupId: turn.scope.groupId, reason: error.code || error.message })
+          return { rejected: true, reason: error.code || error.message }
+        }
+      }
+    }
+  },
+
+  async cleanupPromptCacheHistory() {
+    const today = beijingDay().dayKey
+    const keys = await this.scanRedisKeys(`${(this.contextStore || contextStore).prefix}*`)
+    const expired = keys.filter(key => {
+      const day = key.match(/\{[^}]+:(\d{8})\}/)?.[1]
+      return day && day < today
+    })
+    const client = (this.contextStore || contextStore).client || globalThis.redis
+    for (const key of expired) await client.del(key)
+  },
+
   async getGroupUserMessages(groupId, userId) {
     const redisKey = `${this.messageHistoriesRedisKey}:${groupId}:${userId}`
     const filePath = path.join(this.messageHistoriesDir, `${groupId}_${userId}.json`)

@@ -1,6 +1,8 @@
 // API 客户端入口：YTapi（主对话/工具调用双阶段）与 callAI（通用子系统调用）。
 // 格式转换 / 传输 / 响应解析已拆至 utils/api/*，本文件只保留编排逻辑。
 import { removeToolPromptsFromMessages } from "../utils/textUtils.js"
+import { cacheRequestContext } from '../core/cacheTurn.js'
+import { cacheDiagnostic, cacheFingerprint, tokenEstimate } from '../core/promptCache.js'
 import {
     detectApiFormat,
     applyClaudeCodeHeaders,
@@ -58,9 +60,39 @@ export function buildToolRequestData(requestData, model) {
  */
 export async function YTapi(requestData, config, toolContent, toolName) {
     const provider = config.providers?.toLowerCase();
+    const cacheTurn = cacheRequestContext(requestData)
+    const pendingObservations = new Map()
+    const beginObservation = (stage, started) => {
+        if (!cacheTurn) return
+        const record = { stage, started, reported: false }
+        pendingObservations.set(stage, record)
+    }
+    const observe = (stage, data, response, started) => {
+        if (!cacheTurn) return
+        const pending = pendingObservations.get(stage)
+        if (!pending || pending.reported) return
+        pending.reported = true
+        const usage = data?.usage || {}
+        const record = {
+            stage, groupId: cacheTurn.scope.groupId, turnId: cacheTurn.turnId,
+            model: response?.headers?.get('x-mapped-model') || (stage === 'tools' ? config.toolsAiConfig.toolsAiModel : config.chatAiConfig.chatApiModel),
+            account: response?.headers?.get('x-account-email') ? cacheFingerprint(response.headers.get('x-account-email')).slice(0, 12) : null,
+            gatewaySession: response?.headers?.get('x-session-id') || null,
+            input: usage.prompt_tokens ?? usage.input_tokens ?? null,
+            cached: usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? null,
+            output: usage.completion_tokens ?? usage.output_tokens ?? null,
+            status: response?.status ?? null, durationMs: Date.now() - started
+        }
+        cacheTurn.requests.push(record)
+        cacheDiagnostic(config, 'request', record)
+    }
 
     try {
         let url, headers, finalRequestData;
+        if (cacheTurn?.settings.diagnostics && tokenEstimate(requestData.messages) + tokenEstimate(requestData.tools || []) + cacheTurn.settings.reserveTokens > cacheTurn.settings.highWater) {
+            // The watermark limits retained history, not mandatory results of the live turn.
+            cacheDiagnostic(config, 'live_turn_budget_overrun', { groupId: cacheTurn.scope.groupId, turnId: cacheTurn.turnId })
+        }
 
         if (config.useTools) {
             // useTools 开启，先调用工具 API
@@ -79,6 +111,7 @@ export async function YTapi(requestData, config, toolContent, toolName) {
             }
 
             let toolsResponse;
+            const toolsStarted = Date.now()
             try {
                 // 保留原始请求中的 tools 字段
                 let toolsRequestData = buildToolRequestData(
@@ -96,10 +129,12 @@ export async function YTapi(requestData, config, toolContent, toolName) {
                     }
                 }
 
+                beginObservation('tools', toolsStarted)
                 const toolsResult = await fetchWithThinkingFallback(toolsUrl, toolsHeaders, toolsRequestData);
                 toolsResponse = toolsResult.response;
 
                 if (!toolsResponse.ok) {
+                    observe('tools', null, toolsResponse, toolsStarted)
                     logger.error(`工具 API 请求失败：${toolsResponse.status} ${toolsResponse.statusText} - ${toolsResult.errorText}`);
                     return { error: `工具 API 请求失败：${toolsResponse.status} ${toolsResponse.statusText} - ${toolsResult.errorText}` };
                 }
@@ -138,6 +173,7 @@ export async function YTapi(requestData, config, toolContent, toolName) {
             }
 
             // 验证转换后的格式
+            observe('tools', toolsData, toolsResponse, toolsStarted)
             if (toolsData && !toolsData.choices?.[0]?.message) {
                 logger.warn('[API] 工具 API 响应格式转换后无效，降级到 OneAPI')
                 // 继续执行降级逻辑，不返回错误
@@ -177,7 +213,7 @@ export async function YTapi(requestData, config, toolContent, toolName) {
             finalRequestData = buildChatRequestData(
                 requestData,
                 config.chatAiConfig.chatApiModel,
-                convertToolMessagesForChat(requestData.messages, toolName)
+                cacheTurn ? cacheTurn.chatMessages() : convertToolMessagesForChat(requestData.messages, toolName)
             );
         } else {
             // useTools 关闭，直接使用 OneAPI
@@ -204,7 +240,7 @@ export async function YTapi(requestData, config, toolContent, toolName) {
             finalRequestData = buildChatRequestData(
                 requestData,
                 config.chatAiConfig.chatApiModel,
-                requestData.messages
+                cacheTurn ? cacheTurn.chatMessages() : requestData.messages
             );
         }
 
@@ -228,9 +264,11 @@ export async function YTapi(requestData, config, toolContent, toolName) {
                 delete finalRequestData.tools;
                 delete finalRequestData.tool_choice;
             }
-            finalRequestData.messages = moveFinalToolPromptToEnd(
-                removeToolPromptsFromMessages(finalRequestData.messages || requestData.messages, hasExecutedTools)
-            )
+            if (!cacheTurn) {
+                finalRequestData.messages = moveFinalToolPromptToEnd(
+                    removeToolPromptsFromMessages(finalRequestData.messages || requestData.messages, hasExecutedTools)
+                )
+            }
         } else if (apiFormat === 'anthropic') {
             // Anthropic 格式转换
             // 注意：对话 API 不传递 tools，避免模型参与工具调用判断
@@ -249,11 +287,14 @@ export async function YTapi(requestData, config, toolContent, toolName) {
         }
 
         logger.debug('最终请求体:', finalRequestData);
+        const chatStarted = Date.now()
         try {
+            beginObservation('chat', chatStarted)
             const result = await fetchWithThinkingFallback(url, headers, finalRequestData);
             response = result.response;
 
             if (!response.ok) {
+                observe('chat', null, response, chatStarted)
                 logger.error(`API 请求失败：${response.status} ${response.statusText} - ${result.errorText}`);
                 return { error: `API 请求失败：${response.status} ${response.statusText} - ${result.errorText}` };
             }
@@ -276,6 +317,7 @@ export async function YTapi(requestData, config, toolContent, toolName) {
                 if (responseData?.error) {
                     return responseData
                 }
+                observe('chat', responseData, response, chatStarted)
                 // SSE 解析后已经是 OpenAI 格式，不需要再走 Anthropic 转换
                 return processResponse(responseData)
             }
@@ -299,11 +341,16 @@ export async function YTapi(requestData, config, toolContent, toolName) {
             }
         }
 
+        observe('chat', responseData, response, chatStarted)
         return processResponse(responseData);
 
     } catch (error) {
         logger.error('YTapi 异常:', error);
         return { error: `发生异常：${error.message}` };
+    } finally {
+        for (const [stage, pending] of pendingObservations) {
+            if (!pending.reported) observe(stage, null, null, pending.started)
+        }
     }
 }
 

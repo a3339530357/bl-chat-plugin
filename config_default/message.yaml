@@ -12,6 +12,17 @@ pluginSettings:
   enableGroupWhitelist: true
   whitelistRejectMsg: 本群未开启此功能哦~
   groupMaxMessages: 30
+  promptCache:
+    enabled: false
+    groups: []
+    highWaterTokens: 65536
+    lowWaterTokens: 32768
+    reserveTokens: 8192
+    rawMaxEvents: 20000
+    rawMaxBytes: 33554432
+    diagnostics: true
+    preserveForcedSubsets: true
+    preserveFinalNoTools: true
   groupChatMemoryDays: 1
   maxToolRounds: 5
   # 分段发送总开关：true=按标点/换行把回复拆成多条消息发送（拟人化，默认）；false=大模型返回什么就整条发送不分段。

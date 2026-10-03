@@ -5,6 +5,13 @@ import { sanitizeFinalReplyText } from "./pseudoToolSanitizer.js"
 import { extractChatKeywords } from "./chatHeuristics.js"
 import { TotalTokens } from "../functions/tools/CalculateToken.js"
 
+function captureDelivery(e, result) {
+  if (e?._promptCacheCaptureReceipts && result?.message_id !== undefined && result?.message_id !== null) {
+    (e._promptCacheDeliveryIds ||= []).push(result.message_id)
+  }
+  return result
+}
+
 export const replySenderMethods = {
   shouldUseTextImageForFinalReply({ content, output, session, toolName, e }) {
     if (toolName === "textImageTool") return false
@@ -26,6 +33,7 @@ export const replySenderMethods = {
     const tool = this.toolInstances?.textImageTool
     try {
       const result = await tool.execute({ text: output }, e)
+      captureDelivery(e, result)
       if (typeof result === "string" && result.trim().startsWith("error:")) {
         throw new Error(result)
       }
@@ -84,9 +92,11 @@ export const replySenderMethods = {
               const quote = shouldQuote && i === 0
               if (segHasAt && msgSegments) {
                 const res = await e.reply(msgSegments, quote)
+                captureDelivery(e, res)
                 lastMessageId = res?.message_id
               } else {
                 const res = await e.reply(seg, quote)
+                captureDelivery(e, res)
                 lastMessageId = res?.message_id
               }
               if (i < segments.length - 1) {
@@ -113,6 +123,7 @@ export const replySenderMethods = {
           const { hasAt, msgSegments } = await this.convertAtInString(output, groupForAt)
           if (hasAt && msgSegments) {
             const res = await e.reply(msgSegments)
+            captureDelivery(e, res)
             return res?.message_id
           }
         } catch (err) {
@@ -132,6 +143,7 @@ export const replySenderMethods = {
       let lastMessageId = null
       if (totalTokens <= 10 && !hasNewline) {
         const res = await e.reply(output, shouldQuote)
+        captureDelivery(e, res)
         lastMessageId = res?.message_id
         return lastMessageId
       }
@@ -140,7 +152,8 @@ export const replySenderMethods = {
       for (let i = 0; i < segments.length; i++) {
         if (segments[i]?.trim()) {
           const quote = shouldQuote && i === 0
-          const res = await e.reply(segments[i].trim(), quote)
+        const res = await e.reply(segments[i].trim(), quote)
+        captureDelivery(e, res)
           lastMessageId = res?.message_id
 
           if (i < segments.length - 1) {
@@ -164,12 +177,14 @@ export const replySenderMethods = {
           let lastId = null
           for (const seg of fallbackSegments) {
             const res = await e.reply(seg.trim())
+            captureDelivery(e, res)
             lastId = res?.message_id
           }
           return lastId
         }
       } catch {}
       const res = await e.reply(output)
+      captureDelivery(e, res)
       return res?.message_id
     }
   }

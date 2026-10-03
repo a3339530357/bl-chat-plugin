@@ -3,7 +3,7 @@ import { MemoryManager } from "../utils/MemoryManager.js"
 import { ExpressionLearner } from "../utils/ExpressionLearner.js"
 import KnowledgeSearcher from "../functions/KnowledgeSearcher.js"
 import KnowledgeExpander from "../functions/KnowledgeExpander.js"
-import { MessageManager } from "../utils/MessageManager.js"
+import { MessageManager, getV2MessageManager } from "../utils/MessageManager.js"
 import { localToolRegistry } from "../utils/LocalToolRegistry.js"
 import { pluginBridge } from "../utils/pluginBridge.js"
 import { toolConfigHasName } from "./toolConfig.js"
@@ -53,6 +53,8 @@ export function buildMemoryConfig(config) {
 
 export function initializeSharedState(config) {
   if (sharedState) {
+    sharedState.config = config
+    if (config.promptCache?.enabled || sharedState.v2MessageManager) sharedState.v2MessageManager = getV2MessageManager(config)
     // 热更新：直接覆盖各 Manager 的 config，无需 Manager 侧改动。
     //
     // 【热更覆盖范围】此分支只需要处理"自己持有 config 副本的子系统"；
@@ -67,8 +69,8 @@ export function initializeSharedState(config) {
     // 【不在此处、但有各自热更途径】emojiPackManager 每次选图前自行 refreshConfig；
     // qqMusicToken 由定时任务每 10 分钟重读；MCP 服务变更走 #mcp 重载（mcp-servers.yaml 不热更）。
     // 新增"子系统持有副本"型字段时必须同步扩展本分支，否则热更不生效（见 CLAUDE.md 工作约定）。
-    sharedState.messageManager.groupMaxMessages = config.groupMaxMessages || 100
-    sharedState.messageManager.cacheExpireDays = config.groupChatMemoryDays
+    sharedState.messageManager.GROUP_MAX_MESSAGES = config.groupMaxMessages || 100
+    sharedState.messageManager.CACHE_EXPIRE_DAYS = config.groupChatMemoryDays || 1
     Object.assign(sharedState.emotionManager.config, {
       decayRate: config.emotionSystem?.decayRate || 0.02,
       eventWeights: {
@@ -106,6 +108,8 @@ export function initializeSharedState(config) {
     return applyToolRegistrySnapshot(sharedState)
   }
   sharedState = {
+    config,
+    v2MessageManager: config.promptCache?.enabled ? getV2MessageManager(config) : null,
     messageManager: new MessageManager({
       privateMaxMessages: 100,
       groupMaxMessages: config.groupMaxMessages,

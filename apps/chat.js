@@ -9,7 +9,11 @@ import path from "path"
 import { randomUUID } from "crypto"
 import schedule from 'node-schedule'
 import { parseToolConfigEntry } from "../core/toolConfig.js"
-import { buildChatSystemPrompt } from "../core/prompts.js"
+import { buildChatSystemPrompt, buildPromptCacheHeaders } from "../core/prompts.js"
+import { isPromptCacheEnabled, botIdForEvent, wireClone, freezeWire, replayEventRow, cacheDiagnostic } from '../core/promptCache.js'
+import { contextStore } from '../core/contextStore.js'
+import { bindCacheRequest } from '../core/cacheTurn.js'
+import { getV2MessageManager } from '../utils/MessageManager.js'
 import { initializeSharedState, getSharedState, refreshLocalTools, applyToolRegistrySnapshot } from "../core/sharedState.js"
 import { configManagerMethods } from "../core/configManager.js"
 import { taskStatusMethods } from "../core/taskStatus.js"
@@ -127,6 +131,10 @@ export class ChatPlugin extends plugin {
   }
 
   initScheduledTasks() {
+    schedule.scheduleJob({ rule: '0 0 * * *', tz: 'Asia/Shanghai' }, async () => {
+      if (!getSharedState()?.config?.promptCache?.enabled) return
+      await this.cleanupPromptCacheHistory().catch(error => logger.error('[PromptCacheV2] daily cleanup failed:', error))
+    })
     // 每天0点清理消息历史记录
     schedule.scheduleJob('0 0 * * *', async () => {
       try {
@@ -210,6 +218,7 @@ export class ChatPlugin extends plugin {
       await this.deleteRedisKeys(keys)
       logger.info(`已清除${keys.length}条消息历史记录`)
     }
+    if (this.config.promptCache?.enabled) await this.cleanupPromptCacheHistory()
   }
 
   async beginConversationTask(e) {
@@ -334,20 +343,21 @@ export class ChatPlugin extends plugin {
     return models[this.getProvider()]
   }
 
-  buildRequestData(messages, tools, toolChoice = "auto") {
+  buildRequestData(messages, tools, toolChoice = "auto", cacheTurn = null) {
+    const config = cacheTurn?.apiConfig || this.config
     const data = {
-      model: this.getModel(),
+      model: cacheTurn ? config.chatAiConfig.chatApiModel : this.getModel(),
       messages,
       // 最终聊天偏自然表达；工具决策会在 YTapi 中单独降温。
       temperature: 0.85,
       top_p: 0.95
     }
 
-    if (this.config.useTools && tools?.length && toolChoice !== "none") {
+    if (config.useTools && tools?.length && (toolChoice !== "none" || cacheTurn)) {
       data.tools = tools
       data.tool_choice = toolChoice
     }
-    return data
+    return bindCacheRequest(data, cacheTurn)
   }
 
   checkTriggers(e) {
@@ -503,6 +513,12 @@ export class ChatPlugin extends plugin {
       e.sessionId = sessionId
       const session = this.getOrCreateSession(sessionId, this.tools)
       session.taskContext = taskContext
+      session.turnId = sessionId
+      const useCacheV2 = isPromptCacheEnabled(this.config, groupId)
+      const cacheConfig = useCacheV2 ? wireClone(this.config) : null
+      const cacheStore = this.contextStore || contextStore
+      const cacheScope = useCacheV2 ? cacheStore.scope(botIdForEvent(e), groupId) : null
+      cacheScope?.catch(() => {})
 
       // smart 模式下记录本轮默认只覆盖到自身事件；读取群历史快照后会提升到当时的
       // groupContextVersion，供 smart Gate 判断排队的 @/新消息是否已经被本轮回复覆盖。
@@ -540,6 +556,7 @@ export class ChatPlugin extends plugin {
           const members = await group.getMemberMap()
           return Array.from(members.values())
             .filter(m => ["admin", "owner"].includes(m.role))
+            .sort((a, b) => useCacheV2 ? String(a.user_id).localeCompare(String(b.user_id), 'en', { numeric: true }) : 0)
             .map(m => `${m.nickname}(QQ号: ${m.user_id})[群身份: ${roleMap[m.role]}]`)
             .join("\n")
         }
@@ -593,12 +610,14 @@ export class ChatPlugin extends plugin {
         // 获取机器人在当前群的真实身份信息(群名片可能被 changeCardTool 改过)
         let botCardInGroup = Bot.nickname || "机器人"
         let botRoleInGroup = "member"
+        let botIdentityReliable = false
 
         try {
-          const botMemberInfo = await e.group?.pickMember?.(Bot.uin)?.getInfo?.()
+          const botMemberInfo = await e.group?.pickMember?.(useCacheV2 ? botIdForEvent(e) : Bot.uin)?.getInfo?.()
           logger.debug(`[身份信息] Bot.uin=${Bot.uin}, botMemberInfo=`, JSON.stringify(botMemberInfo))
 
           if (botMemberInfo) {
+            botIdentityReliable = !!((botMemberInfo.card && botMemberInfo.card.trim()) || botMemberInfo.nickname) && !!roleMap[botMemberInfo.role]
             botCardInGroup = (botMemberInfo.card && botMemberInfo.card.trim()) || botMemberInfo.nickname || Bot.nickname || "机器人"
             botRoleInGroup = roleMap[botMemberInfo.role] || "member"
           }
@@ -621,8 +640,55 @@ export class ChatPlugin extends plugin {
           mcpPrompts,
           toolHistoryPrompt
         })
+        session.userContent = userContent
+        if (useCacheV2) {
+          try {
+            session.cacheToolsPinned = true
+            const originalTools = wireClone(session.tools)
+            const declarations = cacheConfig.useTools ? [...new Map([
+              ...originalTools,
+              ...this.getToolsByName(['videoAnalysisTool', 'googleImageEditTool', 'aiMindMapTool', 'grabRedBagTool'], { warnMissing: false })
+            ].map(tool => [tool.function.name, tool])).values()].sort((a, b) => a.function.name.localeCompare(b.function.name, 'en')) : []
+            const scope = await cacheScope
+            const remembered = !botIdentityReliable ? await cacheStore.header(scope) : null
+            const header = buildPromptCacheHeaders({
+              systemContent: cacheConfig.systemContent, botCardInGroup: remembered?.identity?.botCardInGroup || botCardInGroup,
+              botUin: botIdForEvent(e), groupContext, administrators,
+              botRoleInGroup: remembered?.identity?.botRoleInGroup || botRoleInGroup,
+              reliable: botIdentityReliable || !!remembered?.identity
+            }, declarations, { tools: cacheConfig.toolsAiConfig?.toolsAiModel, chat: cacheConfig.chatAiConfig?.chatApiModel })
+            if (String(this.config.chatTriggerMode || 'strict').toLowerCase() === 'smart') {
+              e._smartHistoryContextVersion = this.getSmartState(groupId).groupContextVersion || 0
+            }
+            let allowedTools = cacheConfig.useTools ? originalTools.map(tool => tool.function.name) : []
+            if (videos?.length) allowedTools = this.getToolsByName(['videoAnalysisTool']).map(tool => tool.function.name)
+            if (cacheConfig.forcedAvatarMode && msg?.includes('头像编辑')) allowedTools = this.getToolsByName(['googleImageEditTool']).map(tool => tool.function.name)
+            if (msg?.includes('导图') || msg?.includes('思维导图')) allowedTools = this.getToolsByName(['aiMindMapTool']).map(tool => tool.function.name)
+            if (e.forceGrabRedBag) allowedTools = this.getToolsByName(['grabRedBagTool']).map(tool => tool.function.name)
+            const avatar = cacheConfig.forcedAvatarMode && msg?.includes('头像编辑')
+              ? `[用户头像链接: (https://q1.qlogo.cn/g?b=qq&nk=${e.user_id}&s=640)]` : ''
+            const manager = getV2MessageManager(cacheConfig, { update: false })
+            session.cacheTurn = await this.preparePromptCacheTurn({
+              e, session, scope, header, userContent: userContent + avatar, manager, allowedTools, config: cacheConfig,
+              references: {
+                '北京时间': "北京时间: " + new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }),
+                '角色状态': enhancedPrompts, '工具调用历史': toolHistoryPrompt,
+                '群公告': groupContext.groupNotice, 'MCP扩展能力': mcpPrompts
+              }
+            })
+            session.cacheTurn.apiConfig = cacheConfig
+            session.allowedToolNames = new Set(allowedTools)
+            session.tools = freezeWire(wireClone(session.cacheTurn.header.tools))
+            session.groupUserMessages = [...session.cacheTurn.toolBase]
+            this.messageManager = manager
+            e._promptCacheCaptureReceipts = true
+          } catch (error) {
+            session.cacheToolsPinned = false
+            cacheDiagnostic(this.config, 'v1_fallback', { groupId, reason: error.code || error.message })
+          }
+        }
         // 获取历史记录
-        if (this.config.groupHistory) {
+        if (!session.cacheTurn && this.config.groupHistory) {
           // 在发起历史读取前固定版本。读取期间才到达的新消息不保证已包含在本次
           // Redis 快照里，必须留给 smart 排队重跑，不能用读取完成后的更高版本冒充已覆盖。
           const smartHistoryContextVersion = String(this.config.chatTriggerMode || 'strict').toLowerCase() === 'smart'
@@ -664,40 +730,45 @@ export class ChatPlugin extends plugin {
           }
         }
 
-        groupUserMessages = groupUserMessages.filter(m => m.role !== "system")
-        groupUserMessages.unshift({ role: "system", content: systemContent })
-        groupUserMessages.push({ role: "user", content: userContent })
-        session.userContent = userContent
-        groupUserMessages = this.trimMessageHistory(groupUserMessages)
-        groupUserMessages = this.filterChatByQQ(groupUserMessages, e.user_id)
-        session.groupUserMessages = this.formatMessages(groupUserMessages, e, userContent)
+        if (!session.cacheTurn) {
+          groupUserMessages = groupUserMessages.filter(m => m.role !== "system")
+          groupUserMessages.unshift({ role: "system", content: systemContent })
+          groupUserMessages.push({ role: "user", content: userContent })
+          groupUserMessages = this.trimMessageHistory(groupUserMessages)
+          groupUserMessages = this.filterChatByQQ(groupUserMessages, e.user_id)
+          session.groupUserMessages = this.formatMessages(groupUserMessages, e, userContent)
+        }
 
         let toolChoice = "auto"
         if (videos?.length >= 1) {
-          session.tools = this.getToolsByName(["videoAnalysisTool"])
-          if (session.tools?.length) toolChoice = { type: "function", function: { name: "videoAnalysisTool" } }
+          if (!session.cacheTurn || session.cacheTurn.settings.preserveForcedSubsets) session.tools = this.getToolsByName(["videoAnalysisTool"])
+          if (session.tools?.some(tool => tool.function.name === 'videoAnalysisTool')) toolChoice = { type: "function", function: { name: "videoAnalysisTool" } }
         }
 
-        if (this.config.forcedAvatarMode && msg?.includes("头像编辑")) {
-          session.tools = this.getToolsByName(["googleImageEditTool"])
-          if (session.tools?.length) toolChoice = { type: "function", function: { name: "googleImageEditTool" } }
-          session.groupUserMessages.at(-1).content += `[用户头像链接: (https://q1.qlogo.cn/g?b=qq&nk=${e.user_id}&s=640)]`
+        if ((session.cacheTurn?.apiConfig || this.config).forcedAvatarMode && msg?.includes("头像编辑")) {
+          if (!session.cacheTurn || session.cacheTurn.settings.preserveForcedSubsets) session.tools = this.getToolsByName(["googleImageEditTool"])
+          if (session.tools?.some(tool => tool.function.name === 'googleImageEditTool')) toolChoice = { type: "function", function: { name: "googleImageEditTool" } }
+          if (!session.cacheTurn) session.groupUserMessages.at(-1).content += `[用户头像链接: (https://q1.qlogo.cn/g?b=qq&nk=${e.user_id}&s=640)]`
         }
 
         if (msg?.includes("导图") || msg?.includes("思维导图")) {
-          session.tools = this.getToolsByName(["aiMindMapTool"])
-          if (session.tools?.length) toolChoice = { type: "function", function: { name: "aiMindMapTool" } }
+          if (!session.cacheTurn || session.cacheTurn.settings.preserveForcedSubsets) session.tools = this.getToolsByName(["aiMindMapTool"])
+          if (session.tools?.some(tool => tool.function.name === 'aiMindMapTool')) toolChoice = { type: "function", function: { name: "aiMindMapTool" } }
         }
 
         // 强制抢红包模式
         if (e.forceGrabRedBag) {
-          session.tools = this.getToolsByName(["grabRedBagTool"])
-          if (session.tools?.length) toolChoice = { type: "function", function: { name: "grabRedBagTool" } }
+          if (!session.cacheTurn || session.cacheTurn.settings.preserveForcedSubsets) session.tools = this.getToolsByName(["grabRedBagTool"])
+          if (session.tools?.some(tool => tool.function.name === 'grabRedBagTool')) toolChoice = { type: "function", function: { name: "grabRedBagTool" } }
         }
 
         session.toolContent = await this.buildMessageContent({ nickname: botCardInGroup, user_id: Bot.uin, role: botRoleInGroup }, "", [], [], e.group)
 
-        const requestData = this.buildRequestData(session.groupUserMessages, session.tools, toolChoice)
+        if (session.cacheTurn) session.tools = freezeWire(wireClone(session.tools))
+        if (session.cacheTurn && session.cacheTurn.settings.preserveForcedSubsets && toolChoice !== 'auto') {
+          cacheDiagnostic(cacheConfig, 'forced_tool_subset', { groupId, tools: session.tools.map(tool => tool.function.name) })
+        }
+        const requestData = this.buildRequestData(session.groupUserMessages, session.tools, toolChoice, session.cacheTurn)
         let response = await this.retryRequest(requestData, session.toolContent)
 
         if (!response?.choices?.[0]) {
@@ -710,6 +781,7 @@ export class ChatPlugin extends plugin {
         if (message.tool_calls?.length) {
           await this.processToolCalls(message, e, session, session.groupUserMessages, atQq, senderRole)
         } else if (message.content) {
+          session.cacheTurn?.noteFinalAssistant(message)
           await this.handleTextResponse(message.content, e, session, session.groupUserMessages)
         }
 
@@ -721,6 +793,9 @@ export class ChatPlugin extends plugin {
         this.clearSession(sessionId)
         return true
       } finally {
+        await this.commitPromptCacheTurn(session, e).catch(error => {
+          logger.error('[PromptCacheV2] finalize failed:', error)
+        })
         await this.finishConversationTask(taskContext, session)
         if (e.group_id) this.recordReplyLatency(e.group_id, Date.now() - handleToolStartAt)
       }
@@ -779,6 +854,9 @@ export class ChatPlugin extends plugin {
     }
 
     const now = Math.floor(Date.now() / 1000)
+    const replyOrigin = session.cacheTurn && (botMessageId === null || botMessageId === undefined || String(botMessageId) === '')
+      ? `reply:${session.cacheTurn.turnId}` : null
+    if (replyOrigin) session.cacheTurn.represented.push(replyOrigin)
 
     try {
       // 1. 不再记录工具结果到持久化历史(避免暴露内部格式)
@@ -786,17 +864,29 @@ export class ChatPlugin extends plugin {
 
       // 2. 记录 Bot 的最终回复
       await this.messageManager.recordMessage({
+        ...(replyOrigin ? { _promptCacheOriginKey: replyOrigin } : {}),
         message_type: e.message_type,
         group_id: e.group_id,
         message_id: botMessageId,
         time: now + (session.toolResults?.length || 0) + 1,
         message: [{ type: "text", text: output }],
         source: "send",
-        self_id: Bot.uin,
-        sender: { user_id: Bot.uin, nickname: Bot.nickname, card: Bot.nickname, role: "member" }
-      })
+        self_id: session.cacheTurn?.scope.botId || Bot.uin,
+        sender: { user_id: session.cacheTurn?.scope.botId || Bot.uin, nickname: Bot.nickname, card: Bot.nickname, role: "member" }
+      }, session.cacheTurn ? { promptCacheConfig: session.cacheTurn.apiConfig, contextStore: this.contextStore || contextStore } : {})
     } catch (error) {
       logger.error("[MessageRecord] 记录消息失败：", error)
+    }
+
+    if (session.cacheTurn) {
+      session.cacheTurn.finalReply = freezeWire(replayEventRow({ message: {
+        time: this.formatTime().slice(1, -1), message_id: botMessageId,
+        sender: { user_id: session.cacheTurn.scope.botId, nickname: Bot.nickname, role: 'member' },
+        content: `在群里说: ${output}`
+      } }, session.cacheTurn.scope.botId))
+      if (botMessageId) (e._promptCacheDeliveryIds ||= []).push(botMessageId)
+      this.updateEnhancedSystems(e, e.msg || '', output).catch(error => logger.error('[增强系统] 更新失败:', error))
+      return
     }
 
     // 保存到 messages 数组

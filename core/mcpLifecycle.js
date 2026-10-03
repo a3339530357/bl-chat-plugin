@@ -105,7 +105,7 @@ export const mcpLifecycleMethods = {
     this.tools = [...localTools, ...mcpTools]
 
     for (const session of this.sessionMap.values()) {
-      session.tools = this.tools
+      if (!session.cacheTurn && !session.cacheToolsPinned) session.tools = this.tools
     }
 
   },

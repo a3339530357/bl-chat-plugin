@@ -5,6 +5,8 @@ import { YTapi } from "../utils/apiClient.js"
 import { mcpManager } from "../utils/MCPClient.js"
 import { parseToolConfigEntry } from "./toolConfig.js"
 import { isToolResultError } from "./toolResult.js"
+import { cacheRequestContext } from './cacheTurn.js'
+import { cacheDiagnostic } from './promptCache.js'
 
 // 同一用户同一 dedupe 工具"上一次未完成则跳过新调用"的运行态；模块级跨实例共享
 const activeDedupeToolRuns = new Map()
@@ -30,7 +32,7 @@ export const toolExecutorMethods = {
   async retryRequest(requestData, toolContent, retries = 1, toolName) {
     while (retries >= 0) {
       try {
-        const response = await YTapi(requestData, this.config, toolContent, toolName)
+        const response = await YTapi(requestData, cacheRequestContext(requestData)?.apiConfig || this.config, toolContent, toolName)
         if (response) return response
       } catch (error) {
         logger.error(`API请求失败(${retries}):`, error)
@@ -84,6 +86,7 @@ export const toolExecutorMethods = {
     const isMCPTool = mcpManager.isMCPTool(toolName)
     const isLocalTool = !isMCPTool && this.toolInstances[toolName]
     const isValidTool = session.tools?.some(t => t.function?.name === toolName)
+      && (!session.allowedToolNames || session.allowedToolNames.has(toolName))
 
     if (!isValidTool || (!isMCPTool && !isLocalTool)) {
       return {
@@ -221,9 +224,26 @@ export const toolExecutorMethods = {
 
     while (currentMessage.tool_calls?.length && round < MAX_TOOL_ROUNDS) {
       round++
-      const toolCalls = this.dedupeToolCalls(currentMessage.tool_calls)
+      let candidates = currentMessage.tool_calls
+      if (session.cacheTurn) {
+        const ids = new Set()
+        candidates = (Array.isArray(candidates) ? candidates : []).filter(call => {
+          if (call?.type !== 'function' || typeof call.function?.name !== 'string' || !call.function.name ||
+              typeof call.id !== 'string' || !call.id || ids.has(call.id)) return false
+          ids.add(call.id)
+          return true
+        })
+        if (candidates.length !== currentMessage.tool_calls.length) {
+          cacheDiagnostic(session.cacheTurn.apiConfig || this.config, 'malformed_tool_calls_skipped', {
+            groupId: session.cacheTurn.scope.groupId, skipped: currentMessage.tool_calls.length - candidates.length
+          })
+        }
+        if (!candidates.length) break
+      }
+      const toolCalls = this.dedupeToolCalls(candidates)
       logger.info(`[工具调用] 第 ${round} 轮，共 ${toolCalls.length} 个工具`)
 
+      const roundStart = currentMessages.length
       currentMessages.push(this.normalizeAssistantToolMessage({
         ...currentMessage,
         tool_calls: toolCalls
@@ -233,7 +253,15 @@ export const toolExecutorMethods = {
         toolCalls.map(toolCall => this.runToolCall(toolCall, e, session, senderRole))
       )).filter(Boolean)
 
-      if (validResults.length === 0) break
+      if (validResults.length === 0) {
+        if (session.cacheTurn) currentMessages.splice(roundStart)
+        break
+      }
+      if (session.cacheTurn && validResults.length !== toolCalls.length) {
+        currentMessages[roundStart] = this.normalizeAssistantToolMessage({
+          ...currentMessage, tool_calls: validResults.map(result => result.toolCall)
+        })
+      }
 
       allToolResults.push(...validResults)
       session.toolName = validResults[validResults.length - 1]?.toolName
@@ -256,6 +284,7 @@ export const toolExecutorMethods = {
         name: toolName,
         content: result
       })))
+      session.cacheTurn?.captureTools(currentMessages)
 
       if (validResults.every(r => r._terminal && typeof r.result === 'string' && !r.result.startsWith('error:'))) {
         logger.info(`[工具调用] 本轮全部为终态工具(${validResults.map(r => r.toolName).join(',')})且执行成功，跳过最终文本回复`)
@@ -263,13 +292,14 @@ export const toolExecutorMethods = {
         return
       }
 
-      const nextRequest = this.buildRequestData(currentMessages, session.tools, "auto")
+      const nextRequest = this.buildRequestData(currentMessages, session.tools, "auto", session.cacheTurn)
       const nextResponse = await this.retryRequest(nextRequest, session.toolContent, 1, session.toolName)
       const nextMessage = nextResponse?.choices?.[0]?.message
       if (!nextMessage) break
 
       currentMessage = nextMessage
       if (!currentMessage.tool_calls?.length && currentMessage.content) {
+        session.cacheTurn?.noteFinalAssistant(currentMessage)
         session.toolResults = allToolResults
         await this.handleTextResponse(
           currentMessage.content,
@@ -287,10 +317,15 @@ export const toolExecutorMethods = {
     }
 
     session.toolResults = allToolResults
-    const finalRequest = this.buildRequestData(currentMessages, [], "none")
+    const keepFinalTools = session.cacheTurn && !session.cacheTurn.settings.preserveFinalNoTools
+    if (session.cacheTurn && !keepFinalTools) {
+      cacheDiagnostic(session.cacheTurn.apiConfig || this.config, 'final_no_tools_compatibility', { groupId: session.cacheTurn.scope.groupId })
+    }
+    const finalRequest = this.buildRequestData(currentMessages, keepFinalTools ? session.tools : [], "none", session.cacheTurn)
     const finalResponse = await this.retryRequest(finalRequest, session.toolContent, 1, session.toolName)
 
     if (finalResponse?.choices?.[0]?.message?.content) {
+      session.cacheTurn?.noteFinalAssistant(finalResponse.choices[0].message)
       await this.handleTextResponse(
         finalResponse.choices[0].message.content,
         e,

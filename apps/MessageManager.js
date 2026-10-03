@@ -1,8 +1,9 @@
-import { MessageManager } from '../utils/MessageManager.js'
+import { MessageManager, getV2MessageManager } from '../utils/MessageManager.js'
 import { emojiPackManager } from '../utils/EmojiPackManager.js'
 import { getSharedState } from '../core/sharedState.js'
 import fs from 'fs';
 import YAML from 'yaml';
+import { isPromptCacheEnabled, botIdForEvent } from '../core/promptCache.js';
 export class MessageRecordPlugin extends plugin {
     constructor() {
         super({
@@ -42,7 +43,10 @@ export class MessageRecordPlugin extends plugin {
     }
 
     async onMessage(e) {
-        await this.messageManager.recordMessage(e);
+        const state = getSharedState();
+        const manager = isPromptCacheEnabled(state?.config, e.group_id)
+            ? getV2MessageManager(state.config) : this.messageManager;
+        await manager.recordMessage(e, { messageMaxLength: 200 });
         emojiPackManager.maybeAutoCollect(e).catch(() => {});
         const memoryManager = getSharedState()?.memoryManager;
         memoryManager?.enqueueGroupEvent(e).catch(error => {
@@ -130,7 +134,10 @@ export class MessageRecordPlugin extends plugin {
         const id = type === 'group' ? e.group_id : e.user_id;
 
         try {
-            await this.messageManager.clearMessages(type, id);
+            const state = getSharedState();
+            if (type === 'group' && isPromptCacheEnabled(state?.config, id)) {
+                await getV2MessageManager(state.config).clearMessages(type, id, { botId: botIdForEvent(e) });
+            } else await this.messageManager.clearMessages(type, id);
             e.reply(`已清除${type === 'group' ? '群聊' : '私聊'}消息记录`);
         } catch (error) {
             logger.error(`清除消息记录失败: ${error}`);
