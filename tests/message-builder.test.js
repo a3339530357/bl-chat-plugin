@@ -41,7 +41,34 @@ test("processToolSpecificMessage：v2 短格式记录行整行移除", () => {
 })
 
 test("processToolSpecificMessage：v2 bot 行只剥 [昵称]: 前缀保留正文", () => {
-  assert.equal(clean("[哈基米]: 想听啥？"), "想听啥？")
+  globalThis.Bot = { nickname: '哈基米' }
+  try {
+    assert.equal(clean("[哈基米]: 想听啥？"), "想听啥？")
+    // bot 行带 ID（撤回目标）与第二行 bot 复述（逐行处理）
+    assert.equal(clean("[哈基米][ID:-AbC]: 想听啥"), "想听啥")
+    assert.equal(clean("第一行\n[哈基米]: 第二行复述"), "第一行\n第二行复述")
+    // 非 bot 的短方括号标题不受影响
+    assert.equal(clean("[注意]: 请勿重启服务"), "[注意]: 请勿重启服务")
+    // 旧 bot 前缀也剥
+    assert.equal(clean("[Bot回复]: 想听啥"), "想听啥")
+  } finally { delete globalThis.Bot }
+})
+
+test("processToolSpecificMessage：正文中间的 [ID:x]: 字样不触发兜底截取", () => {
+  assert.equal(clean("请完整保留这段 [ID:abc]: 后面的值是 42"), "请完整保留这段 [ID:abc]: 后面的值是 42")
+  assert.equal(clean("配置写作 `route[ID:abc]: value` 请勿修改"), "配置写作 `route[ID:abc]: value` 请勿修改")
+})
+
+test("processToolSpecificMessage：裸形状日志行只剥前缀保留正文", () => {
+  assert.equal(clean("[17:46:37] worker(123): ENOENT /tmp/input"), "ENOENT /tmp/input")
+})
+
+test("processToolSpecificMessage：冒号后不跨行，下一行回答不丢", () => {
+  assert.equal(clean("[17:46:37] 小羊(123):\n下一行正常回答"), "下一行正常回答")
+})
+
+test("processToolSpecificMessage：旧 [消息ID:x] 标签整行删", () => {
+  assert.equal(clean("[16:11:11] 哈基米(1694409974)[消息ID:abc]: 你好"), "")
 })
 
 test("formatReplayEventRow：v2 短格式与 bot 行", () => {
@@ -56,6 +83,10 @@ test("formatReplayEventRow：v2 短格式与 bot 行", () => {
     sender: { user_id: '1694409974', nickname: '哈基米', role: 'member' }, content: '想听啥' } }, '1694409974')
   assert.equal(bot.role, 'assistant')
   assert.equal(bot.content, '[哈基米]: 想听啥')
+  // bot 行保留消息 ID（撤回定位目标）
+  const botWithId = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37', message_id: '-AbC',
+    sender: { user_id: '1694409974', nickname: '哈基米', role: 'member' }, content: '想听啥' } }, '1694409974')
+  assert.equal(botWithId.content, '[哈基米][ID:-AbC]: 想听啥')
 })
 
 test("processToolSpecificMessage：剥离开头的 说: 前缀", () => {

@@ -8,13 +8,13 @@ export class RecallTool extends AbstractTool {
   constructor() {
     super();
     this.name = 'recallTool';
-    this.description = '撤回消息，当需要撤回之前发送的消息时调用此工具。可以从聊天历史记录中的[消息ID:xxx]获取message_id参数';
+    this.description = '撤回消息，当需要撤回之前发送的消息时调用此工具。可以从聊天历史记录中的[ID:xxx]（旧格式[消息ID:xxx]等价）获取message_id参数';
     this.parameters = {
       type: 'object',
       properties: {
         message_id: {
           type: 'string',
-          description: '要撤回的消息ID，可从聊天历史记录中的[消息ID:xxx]获取，不填则尝试撤回引用的消息'
+          description: '要撤回的消息ID，可从聊天历史记录中的[ID:xxx]（旧格式[消息ID:xxx]等价）获取，不填则尝试撤回引用的消息'
         }
       }
     };

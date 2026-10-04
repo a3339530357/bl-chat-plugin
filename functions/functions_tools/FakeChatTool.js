@@ -154,7 +154,7 @@ export class FakeChatTool extends AbstractTool {
       'content既可直接填写字符串，也可填写OneBot v11消息段数组；支持文字、@、QQ表情、图片、视频、文件、骰子、猜拳、联系人名片和嵌套合并转发。',
       '已有转发只能使用聊天上下文中真实存在的ID，禁止编造；@在聊天记录卡片内只负责显示，不会真的通知对方。',
       '骰子和猜拳可填写期望结果，但QQ协议端可能仍会随机展示。',
-      '调用时必须提供message_ids数组：从聊天上下文中为每个被伪造QQ选取最新一条[消息ID:xxx]以自动复用真实气泡；某个QQ没有可用ID时不要为其填写，完全没有可用ID时传[]，禁止编造。',
+      '调用时必须提供message_ids数组：从聊天上下文中为每个被伪造QQ选取最新一条[ID:xxx]（旧格式[消息ID:xxx]等价）以自动复用真实气泡；某个QQ没有可用ID时不要为其填写，完全没有可用ID时传[]，禁止编造。',
       '注意：这是纯娱乐功能，不要用来伪造涉及金钱、诈骗、造谣的内容。'
     ].join('\n');
     this.parameters = {
@@ -209,7 +209,7 @@ export class FakeChatTool extends AbstractTool {
           items: { type: 'string', pattern: '^-?\\d+$' },
           maxItems: MAX_NODES,
           uniqueItems: true,
-          description: '被伪造QQ的最近真实消息ID数组，必须始终提供。从聊天历史记录中的[消息ID:xxx]获取，每个QQ最多取最新一条；完全没有可用ID时传[]，禁止编造'
+          description: '被伪造QQ的最近真实消息ID数组，必须始终提供。从聊天历史记录中的[ID:xxx]（旧格式[消息ID:xxx]等价）获取，每个QQ最多取最新一条；完全没有可用ID时传[]，禁止编造'
         },
         title: {
           type: 'string',

@@ -32,9 +32,10 @@ export function formatReplayEventRow(event, botId) {
   const sender = message.sender || {}
   if (String(message.content || '').startsWith('【系统提示】')) return null
   const role = String(sender.user_id) === String(botId) ? 'assistant' : 'user'
-  // 渲染 v2 包装：`[HH:MM:SS] 昵称(QQ号)[ID:x]: 内容`；bot 行只留 `[昵称]: 内容`
+  // 渲染 v2 包装：`[HH:MM:SS] 昵称(QQ号)[ID:x]: 内容`；bot 行留 `[昵称][ID:x]: 内容`
+  // （bot 的 ID 必须保留——「撤回你刚才那句」类请求靠它定位目标消息）
   let content = role === 'assistant'
-    ? `[${sender.nickname || 'Bot'}]: ${message.content || ''}`
+    ? `[${sender.nickname || 'Bot'}]${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
     : `[${shortTimeOf(message.time)}] ${sender.nickname}(${sender.user_id})${roleTagOf(sender)}${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
   if (role === 'assistant' && content.length > 200) content = `${content.substring(0, 200)}...`
   return { role, content }
@@ -344,7 +345,7 @@ export const messageBuilderMethods = {
           const assistantContent = msg.content.length > 200
             ? msg.content.substring(0, 200) + "..."
             : msg.content
-          formattedLines.push(`[Bot回复]: ${assistantContent}`)
+          formattedLines.push(`[${(typeof Bot !== 'undefined' && Bot.nickname) || 'Bot'}]: ${assistantContent}`)
         }
       }
     }
@@ -390,14 +391,17 @@ export const messageBuilderMethods = {
   processToolSpecificMessage(content, toolName) {
     let output = sanitizeFinalReplyText(content)
 
-    // 过滤消息记录格式（多行全局匹配）
+    // ── 消息记录复述清洗（v2 渲染 + 旧格式双兼容）──
     // 旧: "[2026-01-27 16:12:51] 哈基米(QQ号: 2127498644)[群身份: member]: 在群里说: xxx"
-    // 旧: "[Bot回复]: [16:11:11] 哈基米(QQ号: xxx)[群身份: xxx]: xxx"
-    // 新(v2): "[16:11:11] 哈基米(1694409974)[管理][ID:xxx]: xxx"
-    // 模板: "[YYYY-MM-DD HH:MM:SS] 迈(QQ号: xxx)[群身份: xxx]: xxx"（AI输出的模板格式）
-    // QQ号标签可选、[群身份]段 0..n 个（含 管理/群主/ID 变体），新旧格式同时可匹配
-    const tagClass = '(?:群身份[:：]\\s*\\w+|管理|群主|ID:[^\\]]*)'
-    output = output.replace(new RegExp(`(?:\\[Bot回复\\][:：]\\s*)?\\[(?:[A-Z]{4}-[A-Z]{2}-[A-Z]{2}\\s+[A-Z]{2}:[A-Z]{2}:[A-Z]{2}|[A-Z]{2}-[A-Z]{2}\\s+[A-Z]{2}:[A-Z]{2}:[A-Z]{2}|\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}|\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}|\\d{2}:\\d{2}:\\d{2})\\]\\s*[^(\n]+\\((?:(?:QQ号|qq号)[:：]\\s*)?\\d+\\)(?:\\[${tagClass}\\])*\\s*[:：]\\s*(?:艾特了\\s*[^(\n]+\\((?:(?:QQ号|qq号)[:：]\\s*)?\\d+\\)(?:\\[${tagClass}\\])*)?\\s*(?:在群里说[:：]\\s*)?[^\\n]*`, 'gi'), '')
+    // 新: "[16:11:11] 哈基米(1694409974)[管理][ID:xxx]: xxx" / "[哈基米][ID:x]: xxx"
+    const tagClass = '(?:群身份[:：]\\s*\\w+|管理|群主|(?:消息)?ID:[^\\]]*)'
+    const timeClass = '[A-Z]{4}-[A-Z]{2}-[A-Z]{2}\\s+[A-Z]{2}:[A-Z]{2}:[A-Z]{2}|[A-Z]{2}-[A-Z]{2}\\s+[A-Z]{2}:[A-Z]{2}:[A-Z]{2}|\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}|\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}|\\d{2}:\\d{2}:\\d{2}'
+    const named = `[^(\n]+\\((?:(?:QQ号|qq号)[:：]\\s*)?\\d+\\)`
+    // R1 强证据整行删：须带身份/ID 标签或「在群里说」引导，行首锚定、冒号后不跨行——
+    // 裸日志行（"[17:46:37] worker(123): ENOENT"）不满足标签条件，不会被整行吞
+    output = output.replace(new RegExp(`(?:^|\\n)(?:\\[Bot回复\\][:：][ \\t]*)?\\[(?:${timeClass})\\][ \\t]*${named}(?:\\[${tagClass}\\])+[ \\t]*[:：][ \\t]*(?:艾特了\\s*${named}(?:\\[${tagClass}\\])*)?[ \\t]*(?:在群里说[:：][ \\t]*)?[^\\n]*`, 'gi'), '\n')
+    // R2 温和剥前缀：裸形状（时间 名(号): ）只删前缀留正文——与日志撞车时内容不丢
+    output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*${named}[ \\t]*[:：][ \\t]*`, 'g'), '\n')
 
     // markdown 链接/图片转纯文本：[文本](url) / ![描述](url) → 文本\n- url
     // （QQ 不渲染 markdown；须在剥离 [图片] 标记之前执行，否则 ![图片](url) 会先被拆坏）
@@ -411,10 +415,17 @@ export const messageBuilderMethods = {
     ]
 
     for (const p of patterns) output = output.replace(p, "").trim()
-    // v2 bot 行复述：行首 `[昵称]: ` 只剥前缀保留正文（正文可能正是要发的内容）
-    output = output.replace(/^[^\S\n]*\[[^\]：:\n]{1,16}\][:：]\s*/g, "").trim()
-    // 消息记录前缀残留时，提取 [群身份: xxx]: 之后的正文（旧格式兜底；v2 加 ID 残段）
-    const match = /\[(?:群身份: .+?|ID:[^\]]*)\][:：]\s*([\s\S]+)/i.exec(output)
+    // bot 行复述：按真实昵称逐行剥 `[昵称][ID:x]: ` 前缀（正文可能正是要发的内容）；
+    // 逐行处理覆盖第二行 bot 行；非 bot 的 `[注意]: ` 类短标题不受影响
+    const botNick = (typeof Bot !== 'undefined' && Bot?.nickname) || 'Bot回复'
+    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    output = output.split('\n').map(line =>
+      line.replace(new RegExp(`^[ \\t]*\\[(?:${esc(botNick)}|Bot回复)\\](?:\\[(?:消息)?ID:[^\\]]*\\])?[:：][ \\t]*`), '')
+    ).join('\n').trim()
+    // 残段兜底：ID/身份标签须紧跟行首或紧贴 `(数字)` senderInfo 残段才截取——
+    // 正文中间出现的 "[ID:abc]: " 字样（配置/代码说明）不会被截
+    const match = new RegExp(`^[^\\n]{0,40}\\((?:(?:QQ号|qq号)[:：]\\s*)?\\d+\\)\\[(?:群身份: [^\\]]+|(?:消息)?ID:[^\\]]*)\\][:：][ \\t]*([\\s\\S]+)`, 'i').exec(output)
+      || /^\[(?:群身份: [^\]]+|(?:消息)?ID:[^\]]*)\][:：][ \t]*([\s\S]+)/i.exec(output)
     if (match) output = match[1]
     output = output.replace(/^[说說][:：]\s/, "")
 

@@ -31,6 +31,12 @@ export class ChatHistoryTool extends AbstractTool {
     const lines = historyText.split('\n');
     
     for (const line of lines) {
+      // v2 bot 行：`[昵称][ID:x]: 内容`（单段方括号，无时间/号码）
+      const botMatch = line.match(/^\[([^\]：:\n]{1,32})\](?:\[(?:消息)?ID:([^\]]*)\])?[:：]\s*(.*)$/)
+      if (botMatch && !/\d{2}:\d{2}:\d{2}/.test(botMatch[1])) {
+        messages.push({ time: botMatch[2] || '', sender: botMatch[1], content: botMatch[3] })
+        continue
+      }
       if (line.startsWith('[')) {
         const match = line.match(/\[(.*?)\] (.*?): (.*)$/);
         if (match) {
