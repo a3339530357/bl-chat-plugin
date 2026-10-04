@@ -19,7 +19,7 @@ import { configManagerMethods } from "../core/configManager.js"
 import { taskStatusMethods } from "../core/taskStatus.js"
 import { toolHistoryMethods } from "../core/toolHistory.js"
 import { tryAutoGrabRedBag } from "../core/redBag.js"
-import { messageBuilderMethods, roleMap } from "../core/messageBuilder.js"
+import { messageBuilderMethods, roleMap, shortTimeOf, roleTagOf } from "../core/messageBuilder.js"
 import { conversationTrackerMethods, activeConversations, trackingThrottle } from "../core/conversationTracker.js"
 import { replySenderMethods } from "../core/replySender.js"
 import { toolExecutorMethods } from "../core/toolExecutor.js"
@@ -470,7 +470,7 @@ export class ChatPlugin extends plugin {
       // 构建完整格式的用户消息
       const senderRole = roleMap[e.sender?.role] || "member"
       const senderName = e.sender?.card || e.sender?.nickname || "未知用户"
-      const userMessageFormatted = `${this.formatTime()} ${senderName}(qq号: ${e.user_id})[群身份: ${senderRole}]: 在群里说: ${e.msg || ''}`
+      const userMessageFormatted = `${this.formatTime()} ${senderName}(${e.user_id})${senderRole === 'admin' ? '[管理]' : senderRole === 'owner' ? '[群主]' : ''}: ${e.msg || ''}`
 
       // 使用批量判断队列
       const isTalking = await this.addToBatchJudgment(conversationKey, userMessageFormatted, activeConv.chatHistory || [], e)
@@ -579,7 +579,7 @@ export class ChatPlugin extends plugin {
           return Array.from(members.values())
             .filter(m => ["admin", "owner"].includes(m.role))
             .sort((a, b) => useCacheV2 ? String(a.user_id).localeCompare(String(b.user_id), 'en', { numeric: true }) : 0)
-            .map(m => `${m.nickname}(QQ号: ${m.user_id})[群身份: ${roleMap[m.role]}]`)
+            .map(m => `${m.nickname}(${m.user_id})${m.role === 'admin' ? '[管理]' : '[群主]'}`)
             .join("\n")
         }
 
@@ -759,7 +759,7 @@ export class ChatPlugin extends plugin {
               .map(msg => ({
                 role: msg.sender.user_id === Bot.uin ? "assistant" : "user",
                 messageId: msg.message_id,
-                content: `[${msg.time}] ${msg.sender.nickname}(QQ号:${msg.sender.user_id})[群身份: ${roleMap[msg.sender.role] || "member"}]${msg.message_id ? `[消息ID:${msg.message_id}]` : ''}: ${msg.content}`
+                content: `[${shortTimeOf(msg.time)}] ${msg.sender.nickname}(${msg.sender.user_id})${roleTagOf(msg.sender)}${msg.message_id ? `[ID:${msg.message_id}]` : ''}: ${msg.content}`
               }))
             )
             groupUserMessages = await Promise.all(groupUserMessages.map(async msg => {
@@ -888,11 +888,11 @@ export class ChatPlugin extends plugin {
         // 添加用户消息
         const senderRole = roleMap[e.sender?.role] || "member"
         const senderName = e.sender?.card || e.sender?.nickname || "未知用户"
-        const userMsg = `${this.formatTime()} ${senderName}(qq号: ${e.user_id})[群身份: ${senderRole}]: 在群里说: ${(session.userContent || e.msg || '').substring(0, 200)}`
+        const userMsg = `${this.formatTime()} ${senderName}(${e.user_id})${senderRole === 'admin' ? '[管理]' : senderRole === 'owner' ? '[群主]' : ''}: ${(session.userContent || e.msg || '').substring(0, 200)}`
         chatHistory.push({ role: 'user', content: userMsg })
 
         // 添加机器人回复
-        const botMsg = `${this.formatTime()} ${Bot.nickname}(qq号:${Bot.uin})[群身份: member]: 在群里说: ${output.substring(0, 200)}`
+        const botMsg = `[${Bot.nickname}]: ${output.substring(0, 200)}`
         chatHistory.push({ role: 'bot', content: botMsg })
 
         // 只保留最近10条
@@ -935,7 +935,7 @@ export class ChatPlugin extends plugin {
       if (session.cacheTurn.mode !== 'agent') session.cacheTurn.finalReply = freezeWire(replayEventRow({ message: {
         time: this.formatTime().slice(1, -1), message_id: botMessageId,
         sender: { user_id: session.cacheTurn.scope.botId, nickname: Bot.nickname, role: 'member' },
-        content: `在群里说: ${output}`
+        content: output
       } }, session.cacheTurn.scope.botId))
       if (botMessageId) (e._promptCacheDeliveryIds ||= []).push(botMessageId)
       this.updateEnhancedSystems(e, e.msg || '', output).catch(error => logger.error('[增强系统] 更新失败:', error))

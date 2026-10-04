@@ -34,6 +34,30 @@ test("processToolSpecificMessage：无时间戳的记录前缀残留时提取正
   assert.equal(clean("哈基米(QQ号: 123)[群身份: member]: 你好呀"), "你好呀")
 })
 
+test("processToolSpecificMessage：v2 短格式记录行整行移除", () => {
+  assert.equal(clean("[16:12:51] 哈基米(1694409974)[ID:-AbC]: 以后注意点。"), "")
+  assert.equal(clean("[16:12:51] 老王(123)[管理]: 让让"), "")
+  assert.equal(clean("你好\n[16:12:51] 小羊(1107491439)[ID:x1]: 测试\n再见"), "你好\n再见")
+})
+
+test("processToolSpecificMessage：v2 bot 行只剥 [昵称]: 前缀保留正文", () => {
+  assert.equal(clean("[哈基米]: 想听啥？"), "想听啥？")
+})
+
+test("formatReplayEventRow：v2 短格式与 bot 行", () => {
+  const user = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37', message_id: '-AbC',
+    sender: { user_id: '1107491439', nickname: '小羊可粒', role: 'member' }, content: '你好' } }, '1694409974')
+  assert.equal(user.role, 'user')
+  assert.equal(user.content, '[17:46:37] 小羊可粒(1107491439)[ID:-AbC]: 你好')
+  const admin = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37',
+    sender: { user_id: '123', nickname: '老王', role: 'admin' }, content: 'hi' } }, '1694409974')
+  assert.equal(admin.content, '[17:46:37] 老王(123)[管理]: hi')
+  const bot = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37',
+    sender: { user_id: '1694409974', nickname: '哈基米', role: 'member' }, content: '想听啥' } }, '1694409974')
+  assert.equal(bot.role, 'assistant')
+  assert.equal(bot.content, '[哈基米]: 想听啥')
+})
+
 test("processToolSpecificMessage：剥离开头的 说: 前缀", () => {
   assert.equal(clean("说: 你好"), "你好")
 })

@@ -8,7 +8,7 @@ import { promisify } from 'node:util'
 import { ContextStore } from '../core/contextStore.js'
 import { promptCacheSettings, tokenEstimate } from '../core/promptCache.js'
 import { buildPromptCacheHeaders } from '../core/prompts.js'
-import { replayRows, replayTokenBudget } from '../core/replayAdapters.js'
+import { replayRows, replayTokenBudget, REPLAY_RENDERER_VERSION } from '../core/replayAdapters.js'
 import { exportAgentReplay, RedisCliClient } from '../scripts/export-agent-replay-as-dual.mjs'
 import { redisFixture } from './helpers/redis-fixture.js'
 
@@ -53,7 +53,7 @@ test('mixed legacy/agent ledger switches views and headers without resetting sou
   const degraded = { ...agentHeader, version: 'unreliable', reliable: false }
   assert.equal((await store.read(scope, degraded, settings)).header.version, agentHeader.version)
   await store.read(scope, dualHeader, settings)
-  const changedProjection = await store.read(scope, { ...dualHeader, rendererVersion: 2 }, settings)
+  const changedProjection = await store.read(scope, { ...dualHeader, rendererVersion: REPLAY_RENDERER_VERSION + 1 }, settings)
   assert.equal(changedProjection.projectionChanged, true)
   assert.equal(changedProjection.cursor, 1)
 })

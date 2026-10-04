@@ -55,11 +55,8 @@ export class ChatHistoryTool extends AbstractTool {
     if (content.includes('发送了一张图片')) {
       return '[图片]';
     }
-    // 处理群消息
-    if (content.startsWith('在群里说:')) {
-      return content.replace('在群里说:', '').trim();
-    }
-    return content;
+    // 处理群消息（旧格式带"在群里说: "前缀，v2 新格式无此前缀）
+    return content.replace(/^在群里说[:：]\s*/, '').trim();
   }
 
   /**

@@ -3,7 +3,9 @@ import { FINAL_TOOL_PROMPT } from '../utils/textUtils.js'
 import { wireClone, tokenEstimate } from './promptCache.js'
 
 export const REPLAY_VERSION = 3
-export const REPLAY_RENDERER_VERSION = 1
+// v2: 消息包装瘦身——历史行去掉日期/`qq号: `标签/`[群身份: member]`/`在群里说: `，
+// 每条省约 20 token（1290 条/天量级省 ~3 万）；旧格式存量由清洗正则兼容，新旧账本块可混排
+export const REPLAY_RENDERER_VERSION = 2
 
 export function agentAssistantRow(message) {
   if (message.role && message.role !== 'assistant') throw new ContextStoreError('invalid_agent_role')
