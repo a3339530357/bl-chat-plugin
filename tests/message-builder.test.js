@@ -71,6 +71,41 @@ test("processToolSpecificMessage：旧 [消息ID:x] 标签整行删", () => {
   assert.equal(clean("[16:11:11] 哈基米(1694409974)[消息ID:abc]: 你好"), "")
 })
 
+test("processToolSpecificMessage：艾特了分支不跨行吞答", () => {
+  // 第一行（艾特了所在记录行）整行删，第二行正文保全（复述中夹的艾特段对象壳残留可接受）
+  assert.equal(clean("[17:46:37] 小羊(123)[ID:x]: 艾特了\nworker(456): ENOENT /tmp/input"), "worker(456): ENOENT /tmp/input")
+})
+
+test("processToolSpecificMessage：无标签但带在群里说引导的旧格式整行删", () => {
+  assert.equal(clean("[17:46:37] 小羊(123): 在群里说: 旧复述"), "")
+})
+
+test("processToolSpecificMessage：多标签残段截取正文", () => {
+  assert.equal(clean("小羊(123)[管理][ID:x]: 正常回答"), "正常回答")
+})
+
+test("processToolSpecificMessage：V1 双层包装（bot 外层+记录内层）整体清洗", () => {
+  globalThis.Bot = { nickname: '哈基米' }
+  try {
+    // 外层 bot 前缀先剥、内层记录行再整行删——整行复述清洗为空（上游有空输出保护不发送）
+    assert.equal(clean("[哈基米]: [17:46:37] 哈基米(123)[ID:10001]: 第一条"), "")
+    assert.equal(clean("[哈基米]: [17:46:37] 哈基米(123): 在群里说: 第二条"), "")
+    // 复述夹在正常正文之间时正文保留
+    assert.equal(clean("正常话\n[哈基米]: [17:46:37] 哈基米(123)[ID:10001]: 复述\n还有话"), "正常话\n还有话")
+  } finally { delete globalThis.Bot }
+})
+
+test("processToolSpecificMessage：markdown 链接定义不被裸标签兜底吞", () => {
+  assert.equal(clean("[ID:abc]: https://example.com/a"), "[ID:abc]: https://example.com/a")
+})
+
+test("processToolSpecificMessage：特殊昵称（含 markdown 元字符）不被链接转换拆坏", () => {
+  globalThis.Bot = { nickname: '哈[基](米)+?' }
+  try {
+    assert.equal(clean("[哈[基](米)+?][ID:10001]: 内容"), "内容")
+  } finally { delete globalThis.Bot }
+})
+
 test("formatReplayEventRow：v2 短格式与 bot 行", () => {
   const user = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37', message_id: '-AbC',
     sender: { user_id: '1107491439', nickname: '小羊可粒', role: 'member' }, content: '你好' } }, '1694409974')

@@ -345,7 +345,10 @@ export const messageBuilderMethods = {
           const assistantContent = msg.content.length > 200
             ? msg.content.substring(0, 200) + "..."
             : msg.content
-          formattedLines.push(`[${(typeof Bot !== 'undefined' && Bot.nickname) || 'Bot'}]: ${assistantContent}`)
+          // 历史回读的 assistant 行可能已带时间/号码包装（V1 持久化格式），不再套第二层——
+          // 双层包装会逃过复述清洗（外层昵称前缀剥掉后内层已过 R1/R2 时机）
+          const alreadyWrapped = /^\[(?:\d{4}-\d{2}-\d{2}\s+)?\d{2}:\d{2}:\d{2}\]/.test(msg.content)
+          formattedLines.push(alreadyWrapped ? assistantContent : `[${(typeof Bot !== 'undefined' && Bot.nickname) || 'Bot'}]: ${assistantContent}`)
         }
       }
     }
@@ -391,19 +394,29 @@ export const messageBuilderMethods = {
   processToolSpecificMessage(content, toolName) {
     let output = sanitizeFinalReplyText(content)
 
-    // ── 消息记录复述清洗（v2 渲染 + 旧格式双兼容）──
+    // ── 消息记录复述清洗管线（v2 渲染 + 旧格式双兼容）──
     // 旧: "[2026-01-27 16:12:51] 哈基米(QQ号: 2127498644)[群身份: member]: 在群里说: xxx"
     // 新: "[16:11:11] 哈基米(1694409974)[管理][ID:xxx]: xxx" / "[哈基米][ID:x]: xxx"
     const tagClass = '(?:群身份[:：]\\s*\\w+|管理|群主|(?:消息)?ID:[^\\]]*)'
     const timeClass = '[A-Z]{4}-[A-Z]{2}-[A-Z]{2}\\s+[A-Z]{2}:[A-Z]{2}:[A-Z]{2}|[A-Z]{2}-[A-Z]{2}\\s+[A-Z]{2}:[A-Z]{2}:[A-Z]{2}|\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}|\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2}|\\d{2}:\\d{2}:\\d{2}'
     const named = `[^(\n]+\\((?:(?:QQ号|qq号)[:：]\\s*)?\\d+\\)`
-    // R1 强证据整行删：须带身份/ID 标签或「在群里说」引导，行首锚定、冒号后不跨行——
-    // 裸日志行（"[17:46:37] worker(123): ENOENT"）不满足标签条件，不会被整行吞
-    output = output.replace(new RegExp(`(?:^|\\n)(?:\\[Bot回复\\][:：][ \\t]*)?\\[(?:${timeClass})\\][ \\t]*${named}(?:\\[${tagClass}\\])+[ \\t]*[:：][ \\t]*(?:艾特了\\s*${named}(?:\\[${tagClass}\\])*)?[ \\t]*(?:在群里说[:：][ \\t]*)?[^\\n]*`, 'gi'), '\n')
-    // R2 温和剥前缀：裸形状（时间 名(号): ）只删前缀留正文——与日志撞车时内容不丢
+
+    // 第 1 步 bot 行前缀剥离（必须最先：趁 markdown 转换未拆坏特殊昵称，且剥掉外层后
+    // 内层记录行还能被后续 R1/R2 清洗——修 V1 双层包装逃逸）
+    const botNick = (typeof Bot !== 'undefined' && Bot?.nickname) || 'Bot回复'
+    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const botPrefixRe = new RegExp(`^[ \\t]*\\[(?:${esc(botNick)}|Bot回复)\\](?:\\[(?:消息)?ID:[^\\]]*\\])?[:：][ \\t]*`)
+    output = output.split('\n').map(line => line.replace(botPrefixRe, '')).join('\n')
+
+    // 第 2 步 R1a 强证据整行删：带身份/ID 标签（行首锚定，所有空白单行化不跨行吞答；
+    // 裸日志行"[17:46:37] worker(123): ENOENT"无标签，不受此条影响）
+    output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*${named}(?:\\[${tagClass}\\])+[ \\t]*[:：][ \\t]*(?:艾特了[ \\t]*${named}(?:\\[${tagClass}\\])*)?[ \\t]*(?:在群里说[:：][ \\t]*)?[^\\n]*`, 'gi'), '\n')
+    // 第 3 步 R1b：无标签但带「在群里说」引导语的旧格式行同样整行删
+    output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*${named}[ \\t]*[:：][ \\t]*在群里说[:：][ \\t]*[^\\n]*`, 'gi'), '\n')
+    // 第 4 步 R2 温和剥前缀：裸形状（时间 名(号): ）只删前缀留正文——与日志撞车时内容不丢
     output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*${named}[ \\t]*[:：][ \\t]*`, 'g'), '\n')
 
-    // markdown 链接/图片转纯文本：[文本](url) / ![描述](url) → 文本\n- url
+    // 第 5 步 markdown 链接/图片转纯文本：[文本](url) / ![描述](url) → 文本\n- url
     // （QQ 不渲染 markdown；须在剥离 [图片] 标记之前执行，否则 ![图片](url) 会先被拆坏）
     output = output.replace(/!?\[(.*?)\]\((.*?)\)/g, "$1\n- $2")
 
@@ -415,17 +428,13 @@ export const messageBuilderMethods = {
     ]
 
     for (const p of patterns) output = output.replace(p, "").trim()
-    // bot 行复述：按真实昵称逐行剥 `[昵称][ID:x]: ` 前缀（正文可能正是要发的内容）；
-    // 逐行处理覆盖第二行 bot 行；非 bot 的 `[注意]: ` 类短标题不受影响
-    const botNick = (typeof Bot !== 'undefined' && Bot?.nickname) || 'Bot回复'
-    const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    output = output.split('\n').map(line =>
-      line.replace(new RegExp(`^[ \\t]*\\[(?:${esc(botNick)}|Bot回复)\\](?:\\[(?:消息)?ID:[^\\]]*\\])?[:：][ \\t]*`), '')
-    ).join('\n').trim()
-    // 残段兜底：ID/身份标签须紧跟行首或紧贴 `(数字)` senderInfo 残段才截取——
-    // 正文中间出现的 "[ID:abc]: " 字样（配置/代码说明）不会被截
-    const match = new RegExp(`^[^\\n]{0,40}\\((?:(?:QQ号|qq号)[:：]\\s*)?\\d+\\)\\[(?:群身份: [^\\]]+|(?:消息)?ID:[^\\]]*)\\][:：][ \\t]*([\\s\\S]+)`, 'i').exec(output)
-      || /^\[(?:群身份: [^\]]+|(?:消息)?ID:[^\]]*)\][:：][ \t]*([\s\S]+)/i.exec(output)
+    // 残段兜底①：senderInfo 形状（昵称+号码括号+一个及以上标签）截取正文。
+    // 已知格式歧义（接受）："route(123)[ID:abc]: value" 这类正文与残段形状本质不可区分，
+    // 自然群聊回复中出现率≈0，按残段处理；正文中间出现的标签不受影响（行首锚定）
+    const match = new RegExp(`^[^\\n]{0,40}\\((?:(?:QQ号|qq号)[:：]\\s*)?\\d+\\)(?:\\[(?:群身份: [^\\]]+|(?:消息)?ID:[^\\]]*|管理|群主)\\])+[:：][ \\t]*([\\s\\S]+)`, 'i').exec(output)
+      // 残段兜底②：行首裸标签（时间被清掉后的残留）；负向断言须在冒号后判（放 [ \t]* 后会被回溯绕过），
+      // 放过 markdown 链接定义 [id]: url
+      || /^\[(?:群身份: [^\]]+|(?:消息)?ID:[^\]]*)\][:：](?!\s*https?:\/\/)[ \t]*([\s\S]+)/i.exec(output)
     if (match) output = match[1]
     output = output.replace(/^[说說][:：]\s/, "")
 
