@@ -7,11 +7,13 @@ import { parseToolConfigEntry } from "./toolConfig.js"
 import { isToolResultError } from "./toolResult.js"
 import { cacheRequestContext } from './cacheTurn.js'
 import { cacheDiagnostic } from './promptCache.js'
+import { agentAssistantRow } from './replayAdapters.js'
 
 // 同一用户同一 dedupe 工具"上一次未完成则跳过新调用"的运行态；模块级跨实例共享
 const activeDedupeToolRuns = new Map()
 
 export const toolExecutorMethods = {
+  normalizeAgentAssistantMessage(message) { return agentAssistantRow(message) },
   getToolRunKey(groupId, userId, toolName) {
     return `${groupId}:${userId}:${toolName}`
   },

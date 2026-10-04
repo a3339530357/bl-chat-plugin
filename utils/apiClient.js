@@ -2,7 +2,7 @@
 // 格式转换 / 传输 / 响应解析已拆至 utils/api/*，本文件只保留编排逻辑。
 import { removeToolPromptsFromMessages } from "../utils/textUtils.js"
 import { cacheRequestContext } from '../core/cacheTurn.js'
-import { cacheDiagnostic, cacheFingerprint, tokenEstimate } from '../core/promptCache.js'
+import { cacheDiagnostic, cacheFingerprint, tokenEstimate, promptCacheSettings, freezeWire } from '../core/promptCache.js'
 import {
     detectApiFormat,
     applyClaudeCodeHeaders,
@@ -13,6 +13,7 @@ import { fetchWithThinkingFallback } from "./api/transport.js"
 import {
     handleStreamResponseUnified,
     parseSSETextUnified,
+    parseAgentSSEText,
     processResponse
 } from "./api/responseParsing.js"
 import {
@@ -52,6 +53,73 @@ export function buildToolRequestData(requestData, model) {
     }
 }
 
+export function resolveAgentRoute(config, scope = {}) {
+    const chat = config.chatAiConfig || {}
+    const keys = (Array.isArray(chat.chatApiKey) ? chat.chatApiKey : [chat.chatApiKey])
+        .filter(key => typeof key === 'string' && key.trim())
+    if (!chat.chatApiUrl || !chat.chatApiModel || !keys.length) throw new Error('agent_route_not_configured')
+    const url = new URL(chat.chatApiUrl)
+    if (!['http:', 'https:'].includes(url.protocol) || detectApiFormat(url.href) !== 'openai') throw new Error('agent_route_not_supported')
+    const pathname = url.pathname.replace(/\/+$/, '')
+    if (!pathname.endsWith('/chat/completions')) url.pathname = pathname.endsWith('/v1') ? `${pathname}/chat/completions` : `${pathname}/v1/chat/completions`
+    const index = parseInt(cacheFingerprint(`${scope.botId}:${scope.groupId}:${scope.dayKey}`).slice(0, 8), 16) % keys.length
+    const settings = promptCacheSettings(config)
+    return freezeWire({ url: url.href, model: chat.chatApiModel, key: keys[index], temperature: settings.agentTemperature,
+        top_p: settings.agentTopP, fingerprint: cacheFingerprint({ url: url.href, model: chat.chatApiModel, key: keys[index] }) })
+}
+
+export async function callChatCompletionOnce(requestData, config, turn = null) {
+    const route = turn?.route || resolveAgentRoute(config, turn?.scope)
+    if (turn) turn.route = route
+    const body = { model: route.model, messages: requestData.messages, temperature: route.temperature, top_p: route.top_p, stream: false }
+    if (config.useTools && (turn?.header.tools || requestData.tools)?.length) {
+        body.tools = turn?.header.tools || requestData.tools
+        body.tool_choice = 'auto'
+    }
+    if (requestData.max_tokens !== undefined) body.max_tokens = requestData.max_tokens
+    const redact = value => String(value || '').split(route.key).join('[redacted]').slice(0, 400)
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        if (turn && (turn.physicalAttempts || 0) >= (turn.maxPhysicalAttempts || Infinity)) return { error: 'agent_attempt_budget_exhausted' }
+        if (turn) turn.physicalAttempts = (turn.physicalAttempts || 0) + 1
+        const started = Date.now()
+        let response
+        let data
+        let error
+        let transportFailed = false
+        try {
+            const result = await fetchWithThinkingFallback(route.url, { Authorization: `Bearer ${route.key}`, 'Content-Type': 'application/json' }, body)
+            response = result.response
+            if (!response.ok) error = `agent_http_${response.status}: ${redact(result.errorText)}`
+            else {
+                const raw = await response.text()
+                try { data = JSON.parse(raw) } catch {
+                    if (raw.includes('data:')) data = parseAgentSSEText(raw)
+                    else error = 'agent_invalid_json'
+                }
+                if (!error && !data?.choices?.[0]?.message) error = data?.error ? redact(data.error.message || data.error) : 'agent_invalid_response'
+            }
+        } catch (caught) {
+            transportFailed = true
+            error = `agent_transport_${caught.code || caught.name || 'failed'}`
+        }
+        if (turn) {
+            const usage = data?.usage || {}
+            const record = { stage: 'agent', groupId: turn.scope.groupId, turnId: turn.turnId, attempt,
+                model: response?.headers?.get('x-mapped-model') || route.model,
+                account: response?.headers?.get('x-account-email') ? cacheFingerprint(response.headers.get('x-account-email')).slice(0, 12) : null,
+                gatewaySession: response?.headers?.get('x-session-id') || null,
+                input: usage.prompt_tokens ?? usage.input_tokens ?? null,
+                cached: usage.prompt_tokens_details?.cached_tokens ?? usage.input_tokens_details?.cached_tokens ?? null,
+                output: usage.completion_tokens ?? usage.output_tokens ?? null,
+                status: response?.status ?? null, durationMs: Date.now() - started, error: error || null }
+            turn.requests.push(record)
+            cacheDiagnostic(config, 'request', record)
+        }
+        if (!error) return processResponse(data)
+        if (!transportFailed || attempt === 2) return { error }
+    }
+}
+
 /**
  * 发送请求到 OpenAI API 或其他提供者并处理响应
  * @param {Object} requestData - 请求体数据
@@ -61,6 +129,7 @@ export function buildToolRequestData(requestData, model) {
 export async function YTapi(requestData, config, toolContent, toolName) {
     const provider = config.providers?.toLowerCase();
     const cacheTurn = cacheRequestContext(requestData)
+    if (cacheTurn?.mode === 'agent') return callChatCompletionOnce(requestData, cacheTurn.apiConfig || config, cacheTurn)
     const pendingObservations = new Map()
     const beginObservation = (stage, started) => {
         if (!cacheTurn) return

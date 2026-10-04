@@ -9,11 +9,12 @@ import { CacheTurn } from './cacheTurn.js'
 import { originKeyForEvent, promptCacheSettings, replayEventRow, tokenEstimate, cacheDiagnostic, beijingDay } from './promptCache.js'
 import { buildTurnReferenceContent } from './prompts.js'
 import { taskStatusMethods } from './taskStatus.js'
+import { replayRows } from './replayAdapters.js'
 
 const _path = process.cwd()
 
 export const sessionHistoryMethods = {
-  async preparePromptCacheTurn({ e, session, scope, header, userContent, references, manager, allowedTools, config = this.config }) {
+  async preparePromptCacheTurn({ e, session, scope, header, userContent, references, manager, allowedTools, agentControls, config = this.config }) {
     const store = this.contextStore || contextStore
     const settings = promptCacheSettings(config)
     await manager.recordMessage(e, {
@@ -24,30 +25,34 @@ export const sessionHistoryMethods = {
     const asOf = new Date().toISOString()
     const preliminary = buildTurnReferenceContent({
       turnId: session.turnId, userId: e.user_id, messageId: e.message_id, asOf,
-      references, taskStatuses: [], allowedTools
+      references, taskStatuses: [], allowedTools, agentControls
     })
-    const incomingTokens = Math.max(tokenEstimate(header.toolSystem) + tokenEstimate(header.tools), tokenEstimate(header.chatSystem)) +
+    const agent = header.mode === 'agent'
+    const incomingTokens = (agent ? tokenEstimate(header.agentSystem) + tokenEstimate(header.tools) :
+      Math.max(tokenEstimate(header.toolSystem) + tokenEstimate(header.tools), tokenEstimate(header.chatSystem))) +
       tokenEstimate(userContent + preliminary)
     const snapshot = await store.read(scope, header, settings, incomingTokens, origin)
     if (snapshot.headerChanged) cacheDiagnostic(config, 'header_change', { groupId: scope.groupId })
+    if (snapshot.modeChanged) cacheDiagnostic(config, 'mode_switch', { groupId: scope.groupId, mode: agent ? 'agent' : 'dual' })
+    if (snapshot.projectionChanged) cacheDiagnostic(config, 'projection_change', { groupId: scope.groupId })
+    if (snapshot.firstModeUse && agent) cacheDiagnostic(config, 'agent_first_use', { groupId: scope.groupId })
     if (snapshot.dropped) cacheDiagnostic(config, 'capacity_trim', { groupId: scope.groupId, blocks: snapshot.dropped })
     const observers = []
     const represented = [origin]
+    const observerBlock = (row, messageIds) => ({
+      ...(agent ? { replayVersion: 3, mode: 'agent', referenceVersion: 2, apiRows: [row] } : { toolRows: [row], chatRows: [row] }),
+      tokens: tokenEstimate(row), messageIds
+    })
     for (const event of snapshot.events) {
       if (event.represented || event.eventId === origin) continue
       const row = replayEventRow(event, scope.botId)
       if (!row) { represented.push(event.eventId); continue }
-      observers.push({ eventId: event.eventId, block: {
-        toolRows: [row], chatRows: [row], tokens: tokenEstimate(row),
-        messageIds: [event.message?.message_id].filter(Boolean)
-      } })
+      observers.push({ eventId: event.eventId, block: observerBlock(row, [event.message?.message_id].filter(Boolean)) })
     }
     const newObserverCount = observers.length
     if (!snapshot.blocks.length) {
       const primer = { role: 'user', content: `当前QQ群[${scope.groupId}]的群聊历史记录。` }
-      observers.unshift({ eventId: `primer:${scope.resetId}:${snapshot.cursor}:${snapshot.readUntil}`, block: {
-        toolRows: [primer], chatRows: [primer], tokens: tokenEstimate(primer), messageIds: []
-      } })
+      observers.unshift({ eventId: `primer:${scope.resetId}:${snapshot.cursor}:${snapshot.readUntil}`, block: observerBlock(primer, []) })
     }
     const messageIds = [...new Set([
       ...snapshot.blocks.flatMap(block => block.messageIds || []),
@@ -55,25 +60,28 @@ export const sessionHistoryMethods = {
     ].filter(id => id !== undefined && id !== null && String(id) !== String(e.message_id)).map(String))]
     const taskStatuses = await taskStatusMethods.getTaskStatusPromptSnapshot.call(this, scope.groupId, messageIds, e.message_id)
     const selected = this.filterChatByQQ([
-      ...observers.flatMap(observer => observer.block.toolRows), { role: 'user', content: userContent }
+      ...observers.flatMap(observer => replayRows(observer.block, agent ? 'agent' : 'tools')), { role: 'user', content: userContent }
     ], e.user_id)
-    if (selected.length !== observers.reduce((sum, observer) => sum + observer.block.toolRows.length, 0) + 1) {
+    if (selected.length !== observers.length + 1) {
       cacheDiagnostic(config, 'qq_filter_bypassed', {
         groupId: scope.groupId, turnId: session.turnId,
-        removed: observers.reduce((sum, observer) => sum + observer.block.toolRows.length, 0) + 1 - selected.length
+        removed: observers.length + 1 - selected.length
       })
     }
     const referenceContent = buildTurnReferenceContent({
       turnId: session.turnId, userId: e.user_id, messageId: e.message_id, asOf,
-      references, taskStatuses, allowedTools, newObserverCount
+      references, taskStatuses, allowedTools, newObserverCount, agentControls
     })
     const turn = new CacheTurn({
       turnId: session.turnId, scope, snapshot, observers, represented, settings, messageId: e.message_id,
-      userRow: { role: 'user', content: userContent + referenceContent }, referenceContent
+      userRow: { role: 'user', content: userContent + referenceContent }, referenceContent, agentControls
     })
-    if (Math.max(tokenEstimate(turn.toolBase) + tokenEstimate(snapshot.header.tools), tokenEstimate(turn.chatBase)) + settings.reserveTokens > settings.highWater) {
+    const requestTokens = agent ? tokenEstimate(turn.agentBase) + tokenEstimate(snapshot.header.tools) :
+      Math.max(tokenEstimate(turn.toolBase) + tokenEstimate(snapshot.header.tools), tokenEstimate(turn.chatBase))
+    if (requestTokens + settings.reserveTokens > settings.highWater) {
       throw new ContextStoreError('incoming_overflow')
     }
+    if (agent) turn.baseTokens = requestTokens
     return turn
   },
 

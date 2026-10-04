@@ -145,6 +145,42 @@ export function parseSSETextUnified(text, apiFormat) {
     }
 }
 
+export function parseAgentSSEText(text) {
+    const message = { role: 'assistant', content: '' }
+    const calls = new Map()
+    const activeIndexes = new Map()
+    const result = { choices: [{ message, finish_reason: 'stop' }] }
+    for (const event of text.replace(/\r\n/g, '\n').split('\n\n')) {
+        const data = event.split('\n').filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).replace(/^ /, '')).join('\n')
+        if (!data) continue
+        if (data === '[DONE]') break
+        let packet
+        try { packet = JSON.parse(data) } catch { return { error: 'agent_invalid_sse' } }
+        if (packet.error) return packet
+        if (packet.usage) result.usage = { ...result.usage, ...packet.usage }
+        for (const key of ['id', 'model', 'created', 'object']) if (packet[key] !== undefined) result[key] = packet[key]
+        const choice = packet.choices?.[0]
+        const delta = choice?.delta || choice?.message
+        if (choice?.finish_reason) result.choices[0].finish_reason = choice.finish_reason
+        if (!delta) continue
+        for (const key of ['content', 'reasoning_content']) if (typeof delta[key] === 'string') message[key] = (message[key] || '') + delta[key]
+        for (const key of ['signature', 'thoughtSignature', 'thought_signature', 'refusal']) if (delta[key] !== undefined) message[key] = delta[key]
+        for (const fragment of delta.tool_calls || []) {
+            const index = fragment.index ?? 0
+            const key = fragment.id || activeIndexes.get(index) || `index:${index}`
+            activeIndexes.set(index, key)
+            const call = calls.get(key) || { id: fragment.id, type: fragment.type || 'function', function: { name: '', arguments: '' } }
+            if (fragment.id) call.id = fragment.id
+            for (const field of ['signature', 'thoughtSignature', 'thought_signature']) if (fragment[field] !== undefined) call[field] = fragment[field]
+            for (const field of ['name', 'arguments']) if (typeof fragment.function?.[field] === 'string') call.function[field] += fragment.function[field]
+            calls.set(key, call)
+        }
+    }
+    if (calls.size) message.tool_calls = [...calls.values()]
+    return result
+}
+
 /**
  * 归一化 API 响应：数组取首个，detail/error 字段统一转为 { error: string }
  * @param {Object|Array} responseData - API 响应数据

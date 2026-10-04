@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { beijingDay, tokenEstimate, replayEventRow } from './promptCache.js'
 import { stripHistoricalTurnReferences } from './prompts.js'
+import { ContextStoreError, nativeReplayRows, replayFormat, replayRows, REPLAY_RENDERER_VERSION } from './replayAdapters.js'
+export { ContextStoreError, validateToolRows } from './replayAdapters.js'
 
 // Keep message/header JSON as strings in Lua: cjson round-trips [] as {}.
 
@@ -40,7 +42,7 @@ return cjson.encode({seq=seq})`
 
 const REFERENCE_HISTORY = `${GUARD}
 local count = redis.call('LLEN', KEYS[6])
-if tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1') == count then return cjson.encode({blocks={}}) end
+if tonumber(redis.call('HGET', KEYS[5], ARGV[4] or 'referenceCleanCount') or '-1') == count then return cjson.encode({blocks={}}) end
 return cjson.encode({blocks=redis.call('LRANGE', KEYS[6], 0, -1)})`
 
 const CLEAN_REFERENCES = `${GUARD}
@@ -52,7 +54,7 @@ end
 for index, block in ipairs(blocks) do
   if block.before ~= block.after then redis.call('LSET', KEYS[6], index-1, block.after) end
 end
-redis.call('HSET', KEYS[5], 'referenceCleanCount', #blocks)
+redis.call('HSET', KEYS[5], ARGV[5] or 'referenceCleanCount', #blocks)
 ${EXPIRE}
 return cjson.encode({cleaned=true})`
 
@@ -79,40 +81,65 @@ for _, encoded in ipairs(events) do
 end
 if expected ~= untilSeq + 1 then return cjson.encode({error='source_gap'}) end
 if incoming > tonumber(ARGV[5]) then return cjson.encode({error='incoming_overflow'}) end
-local header = redis.call('HGET', KEYS[5], 'header')
+local headerKey = ARGV[10]
+local header = redis.call('HGET', KEYS[5], headerKey)
 local candidate = ARGV[4]
 local changed = false
 if not header or (ARGV[9] == '1' and cjson.decode(header).version ~= cjson.decode(candidate).version) then
   changed = header ~= false and header ~= nil
   header = candidate
-  redis.call('HSET', KEYS[5], 'header', header)
+  redis.call('HSET', KEYS[5], headerKey, header)
 end
+local previousMode = redis.call('HGET', KEYS[5], 'lastMode')
+redis.call('HSET', KEYS[5], 'lastMode', ARGV[11])
 local blocks = redis.call('LRANGE', KEYS[6], 0, -1)
+local hasAgent = false
 local total = incoming
-for _, block in ipairs(blocks) do total = total + (cjson.decode(block).tokens or 0) end
+local function blockCost(encoded)
+  local block = cjson.decode(encoded)
+  return ARGV[11] == 'agent' and math.max(block.tokens or 0, block.agentTokens or 0) or (block.tokens or 0)
+end
+for _, block in ipairs(blocks) do
+  local decoded = cjson.decode(block)
+  if decoded.replayVersion == 3 then
+    hasAgent = true
+    if decoded.mode ~= 'agent' or type(decoded.apiRows) ~= 'table' then return cjson.encode({error='unsupported_replay_format'}) end
+  elseif (decoded.replayVersion ~= nil and decoded.replayVersion ~= 2) or
+      (decoded.mode ~= nil and decoded.mode ~= 'dual') or type(decoded.toolRows) ~= 'table' or type(decoded.chatRows) ~= 'table' then
+    return cjson.encode({error='unsupported_replay_format'})
+  end
+  total = total + blockCost(block)
+end
+local previousRenderer = redis.call('HGET', KEYS[5], 'dualRendererVersion')
+local projectionChanged = hasAgent and ARGV[11] == 'dual' and previousRenderer and previousRenderer ~= ARGV[12] or false
+if hasAgent and ARGV[11] == 'dual' then redis.call('HSET', KEYS[5], 'dualRendererVersion', ARGV[12]) end
 local dropped = 0
 if total > tonumber(ARGV[5]) then
   local target = math.max(tonumber(ARGV[6]), incoming)
   while dropped < #blocks and total > target do
     dropped = dropped + 1
-    total = total - (cjson.decode(blocks[dropped]).tokens or 0)
+    total = total - blockCost(blocks[dropped])
   end
   while dropped < #blocks and dropped > 0 do
-    local first = cjson.decode(blocks[dropped+1]).toolRows[1]
+    local decoded = cjson.decode(blocks[dropped+1])
+    local first = (decoded.apiRows or decoded.toolRows)[1]
     if first and first.role == 'user' then break end
     dropped = dropped + 1
-    total = total - (cjson.decode(blocks[dropped]).tokens or 0)
+    total = total - blockCost(blocks[dropped])
   end
   if dropped > 0 then redis.call('LTRIM', KEYS[6], dropped, -1) end
   redis.call('HSET', KEYS[5], 'replayCount', redis.call('LLEN', KEYS[6]))
   local cleanCount = tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1')
   redis.call('HSET', KEYS[5], 'referenceCleanCount', cleanCount == #blocks and (#blocks-dropped) or -1)
+  local budgetCount = tonumber(redis.call('HGET', KEYS[5], 'agentBudgetCount') or '-1')
+  redis.call('HSET', KEYS[5], 'agentBudgetCount', budgetCount == #blocks and (#blocks-dropped) or -1)
 end
 local kept = {}
 for index=dropped+1,#blocks do table.insert(kept, blocks[index]) end
 ${EXPIRE}
 return cjson.encode({cursor=cursor, readUntil=untilSeq, events=decodedEvents, blocks=kept,
-  header=header, headerChanged=changed, dropped=dropped, estimatedTokens=total,
+  header=header, headerChanged=changed, modeChanged=previousMode and previousMode~=ARGV[11] or false,
+  firstModeUse=not previousMode, projectionChanged=projectionChanged, dropped=dropped, estimatedTokens=total,
   rawCount=redis.call('ZCARD', KEYS[3]), rawBytes=tonumber(redis.call('HGET', KEYS[5], 'rawBytes') or '0')})`
 
 const COMMIT = `${GUARD}
@@ -124,6 +151,7 @@ local candidates = cjson.decode(ARGV[6])
 local turn = cjson.decode(ARGV[7])
 local replayCount = redis.call('LLEN', KEYS[6])
 local referencesClean = tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1') == replayCount
+local budgetsKnown = tonumber(redis.call('HGET', KEYS[5], 'agentBudgetCount') or '-1') == replayCount
 local incoming = {}
 for _, candidate in ipairs(candidates) do
   if redis.call('HEXISTS', KEYS[7], candidate.eventId) == 0 then table.insert(incoming, candidate) end
@@ -138,6 +166,7 @@ for _, id in ipairs(represented) do redis.call('HSET', KEYS[7], id, '1') end
 redis.call('HSET', KEYS[5], 'cursor', math.max(cursor, untilSeq))
 redis.call('HSET', KEYS[5], 'replayCount', redis.call('LLEN', KEYS[6]), 'representedCount', redis.call('HLEN', KEYS[7]))
 if referencesClean and turn.referenceVersion == 2 then redis.call('HSET', KEYS[5], 'referenceCleanCount', redis.call('LLEN', KEYS[6])) end
+if budgetsKnown and turn.mode == 'agent' then redis.call('HSET', KEYS[5], 'agentBudgetCount', redis.call('LLEN', KEYS[6])) end
 redis.call('HSET', KEYS[8], ARGV[4], '1')
 ${EXPIRE}
 return cjson.encode({cursor=math.max(cursor, untilSeq), concurrentMerge=cursor~=tonumber(ARGV[9])})`
@@ -151,11 +180,43 @@ const LOOKUP = `${GUARD}
 return cjson.encode({seq=tonumber(redis.call('HGET', KEYS[4], ARGV[4])), latest=tonumber(redis.call('GET', KEYS[2]) or '0')})`
 
 const HEADER = `${GUARD}
-return cjson.encode({header=redis.call('HGET', KEYS[2], 'header') or false})`
+return cjson.encode({header=redis.call('HGET', KEYS[2], ARGV[4]) or false})`
 
-export class ContextStoreError extends Error {
-  constructor(code) { super(`PromptCacheV2: ${code}`); this.code = code }
-}
+const HASH_MAP = `local function hashMap(key)
+  local values = redis.call('HGETALL', key); local result = {}
+  for index=1,#values,2 do result[values[index]]=values[index+1] end
+  return result
+end`
+
+const EXPORT_SNAPSHOT = `${GUARD}
+${HASH_MAP}
+return cjson.encode({blocks=redis.call('LRANGE', KEYS[6], 0, -1), meta=hashMap(KEYS[5]),
+  represented=hashMap(KEYS[7]), committed=hashMap(KEYS[8])})`
+
+const REPLACE_REPLAY = `${GUARD}
+${HASH_MAP}
+local payload = cjson.decode(ARGV[4])
+local before = payload.before; local after = payload.after
+local function matches(key, expected)
+  local count = 0
+  for field, value in pairs(expected) do
+    count = count+1
+    if redis.call('HGET', key, field) ~= value then return false end
+  end
+  return redis.call('HLEN', key) == count
+end
+if redis.call('LLEN', KEYS[6]) ~= #before.blocks or #after.blocks ~= #before.blocks or
+    not matches(KEYS[5], before.meta) or not matches(KEYS[7], before.represented) or not matches(KEYS[8], before.committed) then
+  return cjson.encode({error='rollback_conflict'})
+end
+for index, encoded in ipairs(before.blocks) do
+  if redis.call('LINDEX', KEYS[6], index-1) ~= encoded then return cjson.encode({error='rollback_conflict'}) end
+end
+for index, encoded in ipairs(after.blocks) do redis.call('LSET', KEYS[6], index-1, encoded) end
+for field, _ in pairs(before.meta) do if after.meta[field] == nil then redis.call('HDEL', KEYS[5], field) end end
+for field, value in pairs(after.meta) do redis.call('HSET', KEYS[5], field, value) end
+${EXPIRE}
+return cjson.encode({replaced=#after.blocks})`
 
 export class ContextStore {
   constructor(client = null, prefix = 'ytbot:ctx:v2:') {
@@ -189,9 +250,9 @@ export class ContextStore {
     return this.evaluate(LOOKUP, this.keys(scope).slice(0, 4), [...this.args(scope), eventId])
   }
 
-  async header(scope) {
+  async header(scope, mode = 'dual') {
     const keys = this.keys(scope)
-    const result = await this.evaluate(HEADER, [keys[0], keys[4]], this.args(scope))
+    const result = await this.evaluate(HEADER, [keys[0], keys[4]], [...this.args(scope), mode === 'agent' ? 'agentHeader' : 'header'])
     return result.header ? JSON.parse(result.header) : null
   }
 
@@ -206,16 +267,34 @@ export class ContextStore {
 
   async read(scope, header, settings, incomingTokens = 0, currentOrigin = '') {
     await this.cleanHistoricalReferences(scope)
+    if (header.mode === 'agent') await this.prepareAgentBudgets(scope)
     const result = await this.evaluate(READ, this.keys(scope).slice(0, 7), [
       ...this.args(scope), JSON.stringify(header), settings.highWater, settings.lowWater,
-      incomingTokens + settings.reserveTokens, currentOrigin, header.reliable === false ? '0' : '1'
+      incomingTokens + settings.reserveTokens, currentOrigin, header.reliable === false ? '0' : '1',
+      header.mode === 'agent' ? 'agentHeader' : 'header', header.mode === 'agent' ? 'agent' : 'dual', header.rendererVersion || REPLAY_RENDERER_VERSION
     ])
     // Redis cjson encodes an empty Lua array as {}, not [].
     result.events = Array.isArray(result.events)
       ? result.events.map(event => ({ ...JSON.parse(event.payload), seq: event.seq, represented: event.represented })) : []
     result.blocks = Array.isArray(result.blocks) ? result.blocks.map(block => JSON.parse(block)) : []
+    result.blocks.forEach(nativeReplayRows)
     result.header = JSON.parse(result.header)
     return result
+  }
+
+  async prepareAgentBudgets(scope) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const snapshot = await this.evaluate(REFERENCE_HISTORY, this.keys(scope).slice(0, 6), [...this.args(scope), 'agentBudgetCount'])
+      if (!Array.isArray(snapshot.blocks)) return
+      const blocks = snapshot.blocks.map(before => {
+        const block = JSON.parse(before)
+        const estimate = tokenEstimate(replayRows(block, 'agent'))
+        return { before, after: block.agentTokens === estimate ? before : JSON.stringify({ ...block, agentTokens: estimate }) }
+      })
+      const result = await this.evaluate(CLEAN_REFERENCES, this.keys(scope).slice(0, 6), [...this.args(scope), JSON.stringify(blocks), 'agentBudgetCount'])
+      if (!result.retry) return
+    }
+    throw new ContextStoreError('budget_migration_conflict')
   }
 
   async cleanHistoricalReferences(scope) {
@@ -225,6 +304,7 @@ export class ContextStore {
       if (!Array.isArray(snapshot.blocks)) return
       const blocks = snapshot.blocks.map(before => {
         const block = JSON.parse(before)
+        replayFormat(block)
         const cleaned = stripHistoricalTurnReferences(block)
         if (cleaned !== block) cleaned.tokens = Math.max(tokenEstimate(cleaned.toolRows), tokenEstimate(cleaned.chatRows))
         return { before, after: cleaned === block ? before : JSON.stringify(cleaned) }
@@ -236,7 +316,8 @@ export class ContextStore {
   }
 
   async commit(scope, { turnId, readUntil, baseCursor, observers, block, represented = [] }) {
-    validateToolRows(block.toolRows)
+    nativeReplayRows(block)
+    observers.forEach(observer => nativeReplayRows(observer.block))
     return this.evaluate(COMMIT, this.keys(scope), [
       ...this.args(scope), turnId, readUntil,
       JSON.stringify(observers.map(observer => ({ eventId: observer.eventId, blockJson: JSON.stringify(observer.block) }))),
@@ -244,28 +325,23 @@ export class ContextStore {
     ])
   }
 
+  async exportSnapshot(scope) {
+    const snapshot = await this.evaluate(EXPORT_SNAPSHOT, this.keys(scope), this.args(scope))
+    snapshot.blocks = Array.isArray(snapshot.blocks) ? snapshot.blocks : []
+    snapshot.blocks.forEach(encoded => nativeReplayRows(JSON.parse(encoded)))
+    return snapshot
+  }
+
+  async replaceReplay(scope, before, after) {
+    after.blocks.forEach(encoded => nativeReplayRows(JSON.parse(encoded)))
+    return this.evaluate(REPLACE_REPLAY, this.keys(scope), [...this.args(scope), JSON.stringify({ before, after })])
+  }
+
   async reset(botId, groupId) {
     const day = beijingDay()
     const root = `${this.prefix}{${encodeURIComponent(botId)}:${encodeURIComponent(groupId)}:${day.dayKey}}:`
     return this.evaluate(RESET, [`${root}active`], [randomUUID(), day.deadline, day.expiresAt])
   }
-}
-
-export function validateToolRows(rows = []) {
-  let pending = new Set()
-  for (const row of rows) {
-    if (row.role === 'tool') {
-      if (!pending.delete(row.tool_call_id)) throw new ContextStoreError('unpaired_tool_result')
-    } else {
-      if (pending.size) throw new ContextStoreError('unfinished_tool_calls')
-      if (row.tool_calls?.length) {
-        const ids = row.tool_calls.map(call => call.id)
-        if (ids.some(id => !id) || new Set(ids).size !== ids.length) throw new ContextStoreError('invalid_tool_call_ids')
-        pending = new Set(ids)
-      }
-    }
-  }
-  if (pending.size) throw new ContextStoreError('unfinished_tool_calls')
 }
 
 export const contextStore = new ContextStore()

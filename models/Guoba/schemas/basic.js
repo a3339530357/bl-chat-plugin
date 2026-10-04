@@ -51,8 +51,17 @@ export default [
   { field: 'promptCache.rawMaxEvents', label: 'V2 当日消息源上限', component: 'InputNumber', componentProps: { min: 100, max: 200000 } },
   { field: 'promptCache.rawMaxBytes', label: 'V2 消息源字节上限', component: 'InputNumber', componentProps: { min: 1048576, max: 536870912 } },
   { field: 'promptCache.diagnostics', label: 'V2 缓存诊断日志', component: 'Switch' },
-  { field: 'promptCache.preserveForcedSubsets', label: '强制工具子集兼容', component: 'Switch', bottomHelpMessage: '保留视频、头像、导图、红包场景原有单工具声明，优先保证强制工具行为' },
-  { field: 'promptCache.preserveFinalNoTools', label: '末轮空工具兼容', component: 'Switch', bottomHelpMessage: '保留原空工具收尾，关闭前需验证网关 none 行为' },
+  { field: 'promptCache.singleStage', label: 'V2 单阶段对话', component: 'Switch', bottomHelpMessage: '默认关闭，仅对同时选入 V2 与单阶段灰度的群生效' },
+  { field: 'promptCache.singleStageGroups', label: '单阶段灰度群', component: 'GTags', componentProps: { allowAdd: true, allowDel: true }, bottomHelpMessage: '空列表不启用；* 仍受 V2 灰度群限制' },
+  { field: 'promptCache.agentTemperature', label: '单阶段温度', component: 'InputNumber', componentProps: { min: 0, max: 2, step: 0.05 } },
+  { field: 'promptCache.agentTopP', label: '单阶段 Top P', component: 'InputNumber', componentProps: { min: 0.01, max: 1, step: 0.01 } },
+  { field: 'promptCache.agentSideEffectPolicy', label: '单阶段动作策略', component: 'Select', componentProps: { options: [
+    { label: '轻量自主互动，语音/管理需明确意图', value: 'contextual' },
+    { label: '保留原自主动作策略', value: 'legacy' },
+    { label: '全部副作用需明确请求', value: 'explicit' }
+  ] } },
+  { field: 'promptCache.preserveForcedSubsets', label: '强制工具子集兼容', component: 'Switch', bottomHelpMessage: '仅双阶段生效；单阶段保持工具声明不变' },
+  { field: 'promptCache.preserveFinalNoTools', label: '末轮空工具兼容', component: 'Switch', bottomHelpMessage: '仅双阶段生效；单阶段通过执行预算收口' },
   {
     field: "segmentedReplyEnabled",
     label: "分段发送",

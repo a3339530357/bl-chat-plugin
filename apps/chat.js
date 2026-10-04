@@ -8,9 +8,9 @@ import fs from "fs"
 import path from "path"
 import { randomUUID } from "crypto"
 import schedule from 'node-schedule'
-import { parseToolConfigEntry } from "../core/toolConfig.js"
-import { buildChatSystemPrompt, buildPromptCacheHeaders } from "../core/prompts.js"
-import { isPromptCacheEnabled, botIdForEvent, wireClone, freezeWire, replayEventRow, cacheDiagnostic } from '../core/promptCache.js'
+import { parseToolConfigEntry, buildAgentControls, hasAgentToolIntent, agentToolDenied } from "../core/toolConfig.js"
+import { buildChatSystemPrompt, buildPromptCacheHeaders, buildAgentPromptCacheHeaders } from "../core/prompts.js"
+import { isPromptCacheEnabled, promptCacheMode, agentConfigurationError, botIdForEvent, wireClone, freezeWire, replayEventRow, cacheDiagnostic } from '../core/promptCache.js'
 import { contextStore } from '../core/contextStore.js'
 import { bindCacheRequest } from '../core/cacheTurn.js'
 import { getV2MessageManager } from '../utils/MessageManager.js'
@@ -25,6 +25,8 @@ import { replySenderMethods } from "../core/replySender.js"
 import { toolExecutorMethods } from "../core/toolExecutor.js"
 import { sessionHistoryMethods } from "../core/sessionHistory.js"
 import { mcpLifecycleMethods, startMcpInit } from "../core/mcpLifecycle.js"
+import { agentLoopMethods } from '../core/agentLoop.js'
+import { resolveAgentRoute } from '../utils/apiClient.js'
 
 const _path = process.cwd()
 
@@ -353,6 +355,17 @@ export class ChatPlugin extends plugin {
       top_p: 0.95
     }
 
+    if (cacheTurn?.mode === 'agent') {
+      data.model = cacheTurn.route?.model || config.chatAiConfig.chatApiModel
+      data.temperature = cacheTurn.settings.agentTemperature
+      data.top_p = cacheTurn.settings.agentTopP
+      if (config.useTools && cacheTurn.header.tools.length) {
+        data.tools = cacheTurn.header.tools
+        data.tool_choice = 'auto'
+      }
+      return bindCacheRequest(data, cacheTurn)
+    }
+
     if (config.useTools && tools?.length && (toolChoice !== "none" || cacheTurn)) {
       data.tools = tools
       data.tool_choice = toolChoice
@@ -515,6 +528,7 @@ export class ChatPlugin extends plugin {
       session.taskContext = taskContext
       session.turnId = sessionId
       const useCacheV2 = isPromptCacheEnabled(this.config, groupId)
+      const cacheMode = promptCacheMode(this.config, groupId)
       const cacheConfig = useCacheV2 ? wireClone(this.config) : null
       const cacheStore = this.contextStore || contextStore
       const cacheScope = useCacheV2 ? cacheStore.scope(botIdForEvent(e), groupId) : null
@@ -529,6 +543,13 @@ export class ChatPlugin extends plugin {
       let groupUserMessages = session.groupUserMessages
 
       try {
+        const configurationError = agentConfigurationError(this.config, groupId)
+        if (configurationError) {
+          cacheDiagnostic(this.config, 'agent_config_error', { groupId, reason: configurationError })
+          logger.error(`[单阶段配置] ${configurationError}，本轮未发送模型请求或执行工具`)
+          this.clearSession(sessionId)
+          return true
+        }
         const args = msg?.replace(/^#tool\s*/, "").trim() || ""
         // 同 checkTriggers：TRSS 多账号下 Bot.uin 是数组，须用 e.self_id 做字符串比较，
         // 否则 bot 自己的 @ 会漏进 atQq
@@ -650,13 +671,17 @@ export class ChatPlugin extends plugin {
               ...this.getToolsByName(['videoAnalysisTool', 'googleImageEditTool', 'aiMindMapTool', 'grabRedBagTool'], { warnMissing: false })
             ].map(tool => [tool.function.name, tool])).values()].sort((a, b) => a.function.name.localeCompare(b.function.name, 'en')) : []
             const scope = await cacheScope
-            const remembered = !botIdentityReliable ? await cacheStore.header(scope) : null
-            const header = buildPromptCacheHeaders({
-              systemContent: cacheConfig.systemContent, botCardInGroup: remembered?.identity?.botCardInGroup || botCardInGroup,
+            const remembered = !botIdentityReliable ? await cacheStore.header(scope, cacheMode) : null
+            const rememberedIdentity = remembered?.identity || (!botIdentityReliable && cacheMode === 'agent' ? (await cacheStore.header(scope))?.identity : null)
+            const headerOptions = {
+              systemContent: cacheConfig.systemContent, botCardInGroup: rememberedIdentity?.botCardInGroup || botCardInGroup,
               botUin: botIdForEvent(e), groupContext, administrators,
-              botRoleInGroup: remembered?.identity?.botRoleInGroup || botRoleInGroup,
-              reliable: botIdentityReliable || !!remembered?.identity
-            }, declarations, { tools: cacheConfig.toolsAiConfig?.toolsAiModel, chat: cacheConfig.chatAiConfig?.chatApiModel })
+              botRoleInGroup: rememberedIdentity?.botRoleInGroup || botRoleInGroup,
+              reliable: botIdentityReliable || !!rememberedIdentity
+            }
+            const route = cacheMode === 'agent' ? resolveAgentRoute(cacheConfig, scope) : null
+            const header = cacheMode === 'agent' ? buildAgentPromptCacheHeaders(headerOptions, declarations, route.model, cacheConfig, route.fingerprint) :
+              buildPromptCacheHeaders(headerOptions, declarations, { tools: cacheConfig.toolsAiConfig?.toolsAiModel, chat: cacheConfig.chatAiConfig?.chatApiModel })
             if (String(this.config.chatTriggerMode || 'strict').toLowerCase() === 'smart') {
               e._smartHistoryContextVersion = this.getSmartState(groupId).groupContextVersion || 0
             }
@@ -665,11 +690,24 @@ export class ChatPlugin extends plugin {
             if (cacheConfig.forcedAvatarMode && msg?.includes('头像编辑')) allowedTools = this.getToolsByName(['googleImageEditTool']).map(tool => tool.function.name)
             if (msg?.includes('导图') || msg?.includes('思维导图')) allowedTools = this.getToolsByName(['aiMindMapTool']).map(tool => tool.function.name)
             if (e.forceGrabRedBag) allowedTools = this.getToolsByName(['grabRedBagTool']).map(tool => tool.function.name)
+            let agentControls
+            if (cacheMode === 'agent') {
+              allowedTools = cacheConfig.useTools ? originalTools.map(tool => tool.function.name) : []
+              let forced = false
+              if (cacheConfig.useTools && videos?.length && !agentToolDenied(e, 'videoAnalysisTool')) { allowedTools = this.getToolsByName(['videoAnalysisTool']).map(tool => tool.function.name); forced = true }
+              if (cacheConfig.useTools && cacheConfig.forcedAvatarMode && msg?.includes('头像编辑') && hasAgentToolIntent(e, 'googleImageEditTool')) { allowedTools = this.getToolsByName(['googleImageEditTool']).map(tool => tool.function.name); forced = true }
+              if (cacheConfig.useTools && hasAgentToolIntent(e, 'aiMindMapTool')) { allowedTools = this.getToolsByName(['aiMindMapTool']).map(tool => tool.function.name); forced = true }
+              if (cacheConfig.useTools && e.forceGrabRedBag) { allowedTools = this.getToolsByName(['grabRedBagTool']).map(tool => tool.function.name); forced = true }
+              agentControls = buildAgentControls({ e, tools: declarations, allowedTools,
+                requiredTools: forced ? allowedTools : [], trustedRequiredTools: e.forceGrabRedBag ? ['grabRedBagTool'] : [],
+                config: cacheConfig, senderRole, botId: scope.botId })
+              allowedTools = agentControls.allowedTools
+            }
             const avatar = cacheConfig.forcedAvatarMode && msg?.includes('头像编辑')
               ? `[用户头像链接: (https://q1.qlogo.cn/g?b=qq&nk=${e.user_id}&s=640)]` : ''
             const manager = getV2MessageManager(cacheConfig, { update: false })
             session.cacheTurn = await this.preparePromptCacheTurn({
-              e, session, scope, header, userContent: userContent + avatar, manager, allowedTools, config: cacheConfig,
+              e, session, scope, header, userContent: userContent + avatar, manager, allowedTools, agentControls, config: cacheConfig,
               references: {
                 '北京时间': "北京时间: " + new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }),
                 '角色状态': enhancedPrompts, '工具调用历史': toolHistoryPrompt,
@@ -677,6 +715,7 @@ export class ChatPlugin extends plugin {
               }
             })
             session.cacheTurn.apiConfig = cacheConfig
+            if (route) session.cacheTurn.route = route
             session.allowedToolNames = new Set(allowedTools)
             session.tools = freezeWire(wireClone(session.cacheTurn.header.tools))
             session.groupUserMessages = [...session.cacheTurn.toolBase]
@@ -740,6 +779,7 @@ export class ChatPlugin extends plugin {
         }
 
         let toolChoice = "auto"
+        if (session.cacheTurn?.mode !== 'agent') {
         if (videos?.length >= 1) {
           if (!session.cacheTurn || session.cacheTurn.settings.preserveForcedSubsets) session.tools = this.getToolsByName(["videoAnalysisTool"])
           if (session.tools?.some(tool => tool.function.name === 'videoAnalysisTool')) toolChoice = { type: "function", function: { name: "videoAnalysisTool" } }
@@ -761,12 +801,19 @@ export class ChatPlugin extends plugin {
           if (!session.cacheTurn || session.cacheTurn.settings.preserveForcedSubsets) session.tools = this.getToolsByName(["grabRedBagTool"])
           if (session.tools?.some(tool => tool.function.name === 'grabRedBagTool')) toolChoice = { type: "function", function: { name: "grabRedBagTool" } }
         }
+        }
 
-        session.toolContent = await this.buildMessageContent({ nickname: botCardInGroup, user_id: Bot.uin, role: botRoleInGroup }, "", [], [], e.group)
+        session.toolContent = session.cacheTurn?.mode === 'agent' ? null :
+          await this.buildMessageContent({ nickname: botCardInGroup, user_id: Bot.uin, role: botRoleInGroup }, "", [], [], e.group)
 
         if (session.cacheTurn) session.tools = freezeWire(wireClone(session.tools))
         if (session.cacheTurn && session.cacheTurn.settings.preserveForcedSubsets && toolChoice !== 'auto') {
           cacheDiagnostic(cacheConfig, 'forced_tool_subset', { groupId, tools: session.tools.map(tool => tool.function.name) })
+        }
+        if (session.cacheTurn?.mode === 'agent') {
+          await this.processAgentTurn(e, session, senderRole)
+          this.clearSession(sessionId)
+          return true
         }
         const requestData = this.buildRequestData(session.groupUserMessages, session.tools, toolChoice, session.cacheTurn)
         let response = await this.retryRequest(requestData, session.toolContent)
@@ -823,6 +870,10 @@ export class ChatPlugin extends plugin {
     const botMessageId = shouldUseTextImage
       ? await this.sendFinalReplyAsTextImage(e, output)
       : await this.sendSegmentedMessage(e, output)
+    if (session.cacheTurn?.mode === 'agent' && session.cacheTurn.delivery.failedCount && !session.cacheTurn.delivery.sentCount) {
+      try { e._conversationProducedOutput = false } catch {}
+      return
+    }
     try { e._conversationProducedOutput = true } catch {}
 
     // 更新会话追踪中的对话历史
@@ -857,13 +908,14 @@ export class ChatPlugin extends plugin {
     const replyOrigin = session.cacheTurn && (botMessageId === null || botMessageId === undefined || String(botMessageId) === '')
       ? `reply:${session.cacheTurn.turnId}` : null
     if (replyOrigin) session.cacheTurn.represented.push(replyOrigin)
+    if (session.cacheTurn?.mode === 'agent') session.cacheTurn.delivery.syntheticOrigin = replyOrigin
 
     try {
       // 1. 不再记录工具结果到持久化历史(避免暴露内部格式)
       // 工具结果只在当前轮次上下文中存在,下次加载历史时不会出现
 
       // 2. 记录 Bot 的最终回复
-      await this.messageManager.recordMessage({
+      if (!(session.cacheTurn?.mode === 'agent' && session.cacheTurn.delivery.status === 'partial')) await this.messageManager.recordMessage({
         ...(replyOrigin ? { _promptCacheOriginKey: replyOrigin } : {}),
         message_type: e.message_type,
         group_id: e.group_id,
@@ -879,7 +931,7 @@ export class ChatPlugin extends plugin {
     }
 
     if (session.cacheTurn) {
-      session.cacheTurn.finalReply = freezeWire(replayEventRow({ message: {
+      if (session.cacheTurn.mode !== 'agent') session.cacheTurn.finalReply = freezeWire(replayEventRow({ message: {
         time: this.formatTime().slice(1, -1), message_id: botMessageId,
         sender: { user_id: session.cacheTurn.scope.botId, nickname: Bot.nickname, role: 'member' },
         content: `在群里说: ${output}`
@@ -963,6 +1015,7 @@ Object.assign(
   conversationTrackerMethods,
   replySenderMethods,
   toolExecutorMethods,
+  agentLoopMethods,
   sessionHistoryMethods,
   mcpLifecycleMethods
 )

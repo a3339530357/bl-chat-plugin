@@ -36,6 +36,7 @@ before(async () => {
     response.setHeader('content-type', 'application/json')
     if (mode === 'failure') { response.statusCode = 503; response.end(JSON.stringify({ error: { message: 'test failure' } })); return }
     let message = { role: 'assistant', content: mode === 'empty' ? '' : 'OK' }
+    if (mode === 'raw-text') message = { role: 'assistant', content: 'RAW final text '.repeat(80), reasoning_content: 'native reasoning', signature: 'native signature' }
     if (body.tools && (++decisions === 1 || mode === 'round-limit') && ['tool', 'terminal', 'forced', 'round-limit'].includes(mode)) {
       message = { role: 'assistant', content: '', tool_calls: [{ id: `call-${groupNumber}-${decisions}`, type: 'function', function: { name: selectedTool, arguments: '{}' } }] }
     }
@@ -54,7 +55,7 @@ after(async () => {
 })
 
 async function workflow({ enabled = true, currentMode = 'text', message = 'hello', tool = 'probe', video = false, groupId, useTools = true,
-  textImage = false, store = null, identityFailure = false } = {}) {
+  textImage = false, store = null, identityFailure = false, singleStage = false, sendFailure = false, configure, afterDispatch } = {}) {
   mode = currentMode
   selectedTool = tool
   decisions = 0
@@ -66,7 +67,8 @@ async function workflow({ enabled = true, currentMode = 'text', message = 'hello
   if (store) owner.contextStore = store
   owner.config = {
     enabled: true, providers: 'oneapi', groupHistory: true, useTools,
-    promptCache: { enabled, groups: [group], diagnostics: false },
+    promptCache: { enabled, groups: [group], diagnostics: false, singleStage, singleStageGroups: [group],
+      agentToolPolicies: { probe: { category: 'read' } } },
     groupMaxMessages: 30, groupChatMemoryDays: 1, concurrentLimit: 3, chatTriggerMode: 'strict',
     maxToolRounds: currentMode === 'round-limit' ? 1 : 5,
     forcedAvatarMode: true, segmentedReplyEnabled: false, oneapi_tools: ['probe'],
@@ -74,6 +76,7 @@ async function workflow({ enabled = true, currentMode = 'text', message = 'hello
     toolsAiConfig: { toolsAiUrl: endpoint, toolsAiModel: 'test-model', toolsAiApikey: 'test-key' },
     chatAiConfig: { chatApiUrl: endpoint, chatApiModel: 'test-model', chatApiKey: ['test-key'] }
   }
+  configure?.(owner.config)
   owner.sessionMap = new Map()
   owner.messageManager = new MessageManager()
   owner.messageHistoriesRedisKey = 'group_user_message_history'
@@ -96,6 +99,7 @@ async function workflow({ enabled = true, currentMode = 'text', message = 'hello
   owner.functionMap = new Map(names.map(name => [name, { name, description: name, parameters: { properties: {}, required: [] } }]))
   owner.toolInstances = Object.fromEntries(names.map(name => [name, { async execute() {
     owner.executions.push(name)
+    afterDispatch?.(owner.config)
     return currentMode === 'terminal' ? { terminal: true, result: 'sent' } : 'success'
   } }]))
   owner.tools = owner.getToolsByName(['probe'])
@@ -115,7 +119,7 @@ async function workflow({ enabled = true, currentMode = 'text', message = 'hello
     message_type: 'group', self_id: String(Bot.uin), group_id: group, user_id: '42', message_id: `user-${group}-${instanceId}`,
     msg: message, time: Math.floor(Date.now() / 1000), message: [{ type: 'text', text: message }], sender: { user_id: '42', nickname: 'Alice', role: 'member' },
     group: pickedGroup, bot: { uin: Bot.uin, pickGroup: () => pickedGroup },
-    async reply(content) { replies.push(content); return { message_id: `reply-${group}-${instanceId}-${replies.length}` } }
+    async reply(content) { if (sendFailure) throw new Error('test send failure'); replies.push(content); return { message_id: `reply-${group}-${instanceId}-${replies.length}` } }
   }
   if (video) e.getReply = async () => ({ sender: { user_id: '42', nickname: 'Alice' }, message_id: 'quoted', message: [{ type: 'video', url: 'https://example.test/video.mp4' }] })
   await owner.messageManager.recordMessage(e)
@@ -126,6 +130,152 @@ async function workflow({ enabled = true, currentMode = 'text', message = 'hello
   assert.equal(owner.sessionMap.size, 0)
   return { owner, e, replies, session: sessions[0], group }
 }
+
+test('actual agent text sends one request with full current data and commits raw final fields only once', async () => {
+  const result = await workflow({ singleStage: true, currentMode: 'raw-text' })
+  assert.equal(result.session.cacheTurn.mode, 'agent')
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].tool_choice, 'auto')
+  assert.equal(requests[0].temperature, 0.85)
+  assert.ok(requests[0].messages.at(-1).content.includes('current mood'))
+  assert.ok(!requests[0].messages[0].content.includes('你只负责判断'))
+  const turn = result.session.cacheTurn
+  const snapshot = await contextStore.read(turn.scope, turn.header, turn.settings)
+  const block = snapshot.blocks.at(-1)
+  assert.equal(block.replayVersion, 3)
+  assert.equal('toolRows' in block, false)
+  assert.equal(block.apiRows.at(-1).content, 'RAW final text '.repeat(80))
+  assert.equal(block.apiRows.at(-1).signature, 'native signature')
+  assert.equal(block.apiRows.at(-1).reasoning_content, 'native reasoning')
+  assert.ok(!block.apiRows[0].content.includes('本轮参考资料'))
+  assert.equal(result.replies.length, 1)
+  assert.equal(block.delivery.status, 'sent')
+})
+
+test('actual agent native tool continuation uses two requests and terminal uses one', async () => {
+  const result = await workflow({ singleStage: true, currentMode: 'tool' })
+  assert.deepEqual(result.owner.executions, ['probe'])
+  assert.deepEqual(result.replies, ['OK'])
+  assert.equal(requests.length, 2)
+  assert.deepEqual(requests[1].messages.slice(0, requests[0].messages.length), requests[0].messages)
+  assert.deepEqual(requests[1].tools, requests[0].tools)
+  assert.ok(requests[1].messages.some(row => row.role === 'tool'))
+  assert.ok(!requests[1].messages.some(row => row.content?.includes('[tool_execution]')))
+  const terminal = await workflow({ singleStage: true, currentMode: 'terminal' })
+  assert.equal(requests.length, 1)
+  assert.equal(terminal.session.cacheTurn.exitReason, 'terminal')
+  const snapshot = await contextStore.read(terminal.session.cacheTurn.scope, terminal.session.cacheTurn.header, terminal.session.cacheTurn.settings)
+  assert.equal(snapshot.blocks.at(-1).apiRows.at(-1).role, 'tool')
+})
+
+test('actual agent forced scenes keep full schemas and verify successful required actions', async () => {
+  for (const scene of [
+    { message: '头像编辑', tool: 'googleImageEditTool' },
+    { message: '做个思维导图', tool: 'aiMindMapTool' },
+    { message: '分析视频', tool: 'videoAnalysisTool', video: true }
+  ]) {
+    const result = await workflow({ ...scene, singleStage: true, currentMode: 'forced' })
+    assert.deepEqual(result.owner.executions, [scene.tool])
+    assert.deepEqual(result.session.cacheTurn.agentControls.requiredTools, [scene.tool])
+    assert.ok(requests.every(request => request.tools.length > 1 && request.tool_choice === 'auto'))
+    assert.equal(requests.length, 2)
+  }
+})
+
+test('negated forced keywords do not force editing or drawing in actual agent requests', async () => {
+  for (const message of ['不要头像编辑', '不要生成思维导图']) {
+    const result = await workflow({ singleStage: true, message })
+    assert.deepEqual(result.owner.executions, [])
+    assert.deepEqual(result.session.cacheTurn.agentControls.requiredTools, [])
+    assert.equal(requests.length, 1)
+  }
+})
+
+test('actual agent budget/empty/API-failure paths commit complete blocks and release the session', async () => {
+  const limited = await workflow({ singleStage: true, currentMode: 'round-limit' })
+  assert.equal(limited.owner.executions.length, 1)
+  assert.equal(requests.length, 3)
+  assert.equal(limited.session.cacheTurn.exitReason, 'tool_budget')
+  assert.ok(requests.every(request => request.tools.length && request.tool_choice === 'auto'))
+  for (const currentMode of ['empty', 'failure']) {
+    const result = await workflow({ singleStage: true, currentMode })
+    assert.equal(result.session.cacheTurn.mode, 'agent')
+    const snapshot = await contextStore.read(result.session.cacheTurn.scope, result.session.cacheTurn.header, result.session.cacheTurn.settings)
+    assert.equal(snapshot.blocks.at(-1).apiRows[0].role, 'user')
+    assert.equal(snapshot.blocks.at(-1).exitReason, currentMode === 'empty' ? 'empty' : 'api_error')
+  }
+})
+
+test('actual dual-agent-dual-agent switching retains native results and consumed sequence', async () => {
+  const first = await workflow()
+  const second = await workflow({ groupId: first.group, singleStage: true, currentMode: 'tool' })
+  const third = await workflow({ groupId: first.group })
+  assert.equal(third.session.cacheTurn.mode, 'dual')
+  assert.ok(requests.some(request => request.messages.some(row => row.content?.includes('[tool_execution]'))))
+  const fourth = await workflow({ groupId: first.group, singleStage: true })
+  assert.equal(requests.length, 1)
+  assert.ok(requests[0].messages.some(row => row.role === 'tool' && row.content === 'success'))
+  const snapshot = await contextStore.read(fourth.session.cacheTurn.scope, fourth.session.cacheTurn.header, fourth.session.cacheTurn.settings)
+  assert.ok(snapshot.cursor >= second.session.cacheTurn.snapshot.readUntil)
+  assert.deepEqual(snapshot.blocks.filter(block => block.turnId).map(block => block.mode || 'dual'), ['dual', 'agent', 'dual', 'agent'])
+})
+
+test('actual agent pins its mode, model and declarations despite a config change during dispatch', async () => {
+  const result = await workflow({ singleStage: true, currentMode: 'tool', afterDispatch: config => {
+    config.promptCache.singleStage = false
+    config.chatAiConfig.chatApiModel = 'changed-live-model'
+    config.useTools = false
+  } })
+  assert.equal(result.session.cacheTurn.mode, 'agent')
+  assert.equal(requests.length, 2)
+  assert.ok(requests.every(request => request.model === 'test-model' && request.tools.length && request.tool_choice === 'auto'))
+  assert.deepEqual(result.replies, ['OK'])
+})
+
+test('actual concurrent mixed-mode turns append complete blocks to the same source ledger', async () => {
+  const seed = await workflow()
+  const [dual, agent] = await Promise.all([
+    workflow({ groupId: seed.group }), workflow({ groupId: seed.group, singleStage: true })
+  ])
+  const turn = agent.session.cacheTurn
+  const snapshot = await contextStore.read(turn.scope, turn.header, turn.settings)
+  const modes = snapshot.blocks.filter(block => block.turnId).map(block => block.mode || 'dual').sort()
+  assert.deepEqual(modes, ['agent', 'dual', 'dual'])
+  assert.ok(snapshot.cursor >= Math.max(dual.session.cacheTurn.snapshot.readUntil, turn.snapshot.readUntil))
+  assert.equal(dual.session.cacheTurn.scope.resetId, turn.scope.resetId)
+})
+
+test('actual agent display image receipts suppress duplicate Bot replay and failed sends create no fake Bot journal event', async () => {
+  const image = await workflow({ singleStage: true, textImage: true })
+  assert.deepEqual(image.replies, ['rendered image'])
+  assert.ok(image.session.cacheTurn.delivery.syntheticOrigin)
+  const next = await workflow({ groupId: image.group, singleStage: true })
+  assert.equal(next.session.cacheTurn.agentBase.filter(row => row.role === 'assistant').length, 1)
+  const failed = await workflow({ singleStage: true, sendFailure: true })
+  assert.equal(failed.replies.length, 0)
+  assert.equal(failed.session.cacheTurn.exitReason, 'reply_failed')
+  const snapshot = await contextStore.read(failed.session.cacheTurn.scope, failed.session.cacheTurn.header, failed.session.cacheTurn.settings)
+  assert.equal(snapshot.blocks.at(-1).delivery.status, 'failed')
+  assert.equal(snapshot.blocks.at(-1).apiRows.at(-1).content, 'OK')
+  assert.equal(snapshot.events.length, 0)
+})
+
+test('actual agent without tools sends one chat request and follows agent mode during identity lookup failure', async () => {
+  const first = await workflow({ singleStage: true, useTools: false })
+  assert.equal(requests.length, 1)
+  assert.equal('tools' in requests[0], false)
+  assert.deepEqual(first.owner.executions, [])
+  const second = await workflow({ singleStage: true, useTools: false, groupId: first.group, identityFailure: true })
+  assert.equal(second.session.cacheTurn.header.version, first.session.cacheTurn.header.version)
+  assert.ok(second.session.cacheTurn.header.agentSystem.includes('【对话与动作职责】'))
+})
+
+test('invalid opted-in agent configuration is rejected before any model request instead of widening action policy', async () => {
+  const result = await workflow({ singleStage: true, configure: config => { config.promptCache.agentSideEffectPolicy = 'typo' } })
+  assert.equal(requests.length, 0)
+  assert.deepEqual(result.owner.executions, [])
+  assert.ok(errors.some(error => error.includes('invalid_agent_action_policy')))
+})
 
 test('actual handleTool sends a full dynamic snapshot but commits only body and reply', async () => {
   const result = await workflow()
