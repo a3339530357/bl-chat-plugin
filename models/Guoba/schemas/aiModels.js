@@ -11,14 +11,14 @@ function makeAiBlock(displayName, prefix, urlField, modelField, keyField, urlPla
       field: `${prefix}.${modelField}`,
       label: "┗ 模型名",
       component: "Input",
-      bottomHelpMessage: "模型名称（OneAPI/中转站按自身路由表填写）",
+      bottomHelpMessage: "模型名，按你用的站点给的模型列表填",
       componentProps: { placeholder: modelPlaceholder }
     },
     {
       field: `${prefix}.${keyField}`,
       label: "┗ API Key",
       component: "InputPassword",
-      bottomHelpMessage: "OpenAI 兼容的 Bearer Token",
+      bottomHelpMessage: "这个服务的密钥（sk- 开头那种）",
       componentProps: { placeholder: "sk-xxxxx" }
     }
   ]
@@ -30,43 +30,43 @@ export default [
     label: "AI 模型配置"
   },
   ...makeAiBlock(
-    "对话追踪 trackAiConfig",
+    "对话追踪模型（判断你在不在跟它说话）",
     "trackAiConfig",
     "trackAiUrl", "trackAiModel", "trackAiApikey",
     "https://api.openai.com/v1/chat/completions",
     "gpt-4o-mini",
-    "用于会话追踪时判断用户是否在和 bot 继续对话，推荐快速小模型"
+    "判断群友的消息是不是在跟它说话（没@时的接话判断）。推荐便宜快速的小模型"
   ),
   {
     component: "Select",
     label: "判定通道 judgeProvider",
     field: "trackAiConfig.judgeProvider",
-    bottomHelpMessage: "strict 批量判断与 smart Gate 插话判定共用的判定模型通道。typesafe=TypeSafe Jev 校准概率（配置 trackAiConfig.typesafeApiKey，失败自动回退 flash）；flash=原文本判定。切换后需重启 Yunzai 生效",
+    bottomHelpMessage: "上面两处判断（接着聊、要不要插话）用哪个模型做。TypeSafe=专用判断模型，给出把握程度百分比，失败自动退回上面的对话追踪模型。切换后需重启 Yunzai",
     componentProps: {
       options: [
-        { label: "TypeSafe Jev（校准概率，失败自动回退 flash）", value: "typesafe" },
-        { label: "Flash 文本判定（原行为）", value: "flash" }
+        { label: "TypeSafe 判断模型（给把握百分比，失败自动退回）", value: "typesafe" },
+        { label: "用上面的对话追踪模型判断（原方式）", value: "flash" }
       ]
     }
   },
   ...makeAiBlock(
-    "工具决策 toolsAiConfig",
+    "工具决策模型（判断要不要用工具）",
     "toolsAiConfig",
     "toolsAiUrl", "toolsAiModel", "toolsAiApikey",
     "https://api.openai.com/v1/chat/completions",
     "gemini-2.5-flash",
-    "用于工具决策（何时调工具、表情包满额替换决策等），推荐中等模型"
+    "判断该不该调用某个工具（旧双阶段用；一次搞定模式下由主对话模型兼任）"
   ),
   ...makeAiBlock(
-    "主对话 chatAiConfig",
+    "主对话模型（写回复用的，最重要）",
     "chatAiConfig",
     "chatApiUrl", "chatApiModel", "chatApiKey",
     "https://api.openai.com/v1/chat/completions",
     "gemini-2.5-pro",
-    "主对话使用的模型，决定 bot 回复质量，推荐强模型"
+    "写回复内容用的模型，直接决定它说话的质量和智力，挑最好的"
   ),
   ...makeAiBlock(
-    "图像编辑 imageEditAiConfig",
+    "画图模型",
     "imageEditAiConfig",
     "imageEditApiUrl", "imageEditApiModel", "imageEditApiKey",
     "https://api.openai.com/v1/chat/completions",
@@ -74,15 +74,15 @@ export default [
     "用于 googleImageEditTool（图生图）、bananaTool（文生图）等图片生成工具"
   ),
   ...makeAiBlock(
-    "图像识别/VLM analysisAiConfig",
+    "看图模型（识图）",
     "analysisAiConfig",
     "analysisApiUrl", "analysisApiModel", "analysisApiKey",
     "https://api.openai.com/v1/chat/completions",
     "gemini-3-pro-preview",
-    "用于 googleImageAnalysisTool 识图、表情包系统 VLM 打标和内容审查。必须使用支持视觉输入的多模态模型"
+    "看懂群里的图片、给表情包打标签、内容审核用。必须选能看图的模型（多模态）"
   ),
   ...makeAiBlock(
-    "联网搜索 searchAiConfig",
+    "联网搜索模型",
     "searchAiConfig",
     "searchApiUrl", "searchApiModel", "searchApiKey",
     "https://api.openai.com/v1/chat/completions",
@@ -98,11 +98,11 @@ export default [
     "用于长期记忆提取、表达学习的 AI 场景化学习，推荐小模型省钱"
   ),
   ...makeAiBlock(
-    "Embedding embeddingAiConfig",
+    "语义向量模型（判断意思相近用的）",
     "embeddingAiConfig",
     "embeddingApiUrl", "embeddingApiModel", "embeddingApiKey",
     "https://api.openai.com/v1/embeddings",
     "text-embedding-3-small",
-    "用于知识库语义检索、表情包系统 embedding 召回。注意 URL 是 /v1/embeddings 不是 chat/completions"
+    "把文字变成数字向量、用于按意思匹配（表情包选图、知识库检索）。⚠️ URL 结尾是 /v1/embeddings，不是 chat/completions"
   )
 ]
