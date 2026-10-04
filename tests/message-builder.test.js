@@ -123,6 +123,10 @@ test("processToolSpecificMessage：markdown 定义的尖括号与相对路径形
   assert.equal(clean("[ID:abc]: ./docs/file.md"), "[ID:abc]: ./docs/file.md")
 })
 
+test("processToolSpecificMessage：兜底②损坏裸标签不跨行吞正文", () => {
+  assert.equal(clean("[ID:x\n这里是正常正文\n[注意]: 请勿重启服务"), "[ID:x\n这里是正常正文\n[注意]: 请勿重启服务")
+})
+
 test("formatReplayEventRow：v2 短格式与 bot 行", () => {
   const user = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37', message_id: '-AbC',
     sender: { user_id: '1107491439', nickname: '小羊可粒', role: 'member' }, content: '你好' } }, '1694409974')
