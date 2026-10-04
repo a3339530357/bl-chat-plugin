@@ -2,6 +2,7 @@
 // 回复去抖、批量"是否在和 bot 说话"AI 判断。
 // 以 mixin 形式挂到插件原型上，this 指向插件实例。
 import { callAI } from "../../utils/apiClient.js"
+import { typesafeBatchJudge } from "./typesafeJudge.js"
 
 // 会话追踪: key: `${groupId}_${userId}`, value: { lastActiveTime, chatHistory: [], timer: null }
 // （handleRandomReply / handleTextResponse 也会读写，故导出）
@@ -180,6 +181,28 @@ export const strictTrackingMethods = {
     if (pendingJudgments.length === 0) return
 
     const batch = pendingJudgments.splice(0)
+
+    // TypeSafe (Jev) 判定通道：trackAiConfig.judgeProvider === 'typesafe' 时启用；
+    // 任何失败（网络/HTTP/解析）自动回退下方 flash 文本判定链，不放大故障
+    if (String(this.config.trackAiConfig?.judgeProvider || '').toLowerCase() === 'typesafe') {
+      try {
+        const batchWithIds = batch.map((item, i) => ({
+          ...item,
+          id: `MSG_${i + 1}_${item.e?.group_id || 'g'}_${item.e?.user_id || 'unknown'}`,
+          senderName: item.e?.sender?.card || item.e?.sender?.nickname || '未知用户'
+        }))
+        const { probabilities, threshold } = await typesafeBatchJudge(this.config.trackAiConfig, batchWithIds)
+        logger.info(`[批量判断][typesafe] ${batch.length}条，概率: ${JSON.stringify(probabilities)} (阈值${threshold})`)
+        // 全部命中且无缺失 → 直接按概率出结果；有缺失的条目连同整体回退 flash（保持与原缺项逻辑一致）
+        if (batchWithIds.every(item => typeof probabilities[item.id] === 'number')) {
+          batchWithIds.forEach(item => item.resolve(probabilities[item.id] >= threshold))
+          return
+        }
+        logger.warn('[批量判断][typesafe] 存在缺失判定项，回退 flash 通道')
+      } catch (error) {
+        logger.warn('[批量判断][typesafe] 失败，回退 flash 通道:', error.message)
+      }
+    }
 
     if (batch.length === 1) {
       const result = await this.isUserTalkingToBot(batch[0].userMessage, batch[0].chatHistory)
