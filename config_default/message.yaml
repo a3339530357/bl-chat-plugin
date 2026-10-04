@@ -191,15 +191,15 @@ pluginSettings:
       严禁发送[戳一戳](戳了一下你)等类似伪代码，不要用文字透漏了你戳人了
       你可以写代码和MarkDown提供给别人参考
   forcedAvatarMode: true
+  # 判定通道 judgeProvider：flash（文本 true/false）或 typesafe（TypeSafe Jev 校准概率，失败自动回退 flash）
   trackAiConfig: {
     trackAiUrl: https://api.openai.com/v1/chat/completions,
     trackAiModel: gpt-4o-mini,
-    trackAiApikey: sk-xxxxx
-    # 判定通道：flash（文本 true/false）或 typesafe（TypeSafe Jev 校准概率，失败自动回退 flash）
-    judgeProvider: flash
-    typesafeUrl: https://api.typesafe.ai/v1/systemone
-    typesafeModel: jev-latest
-    typesafeApiKey: ""
+    trackAiApikey: sk-xxxxx,
+    judgeProvider: flash,
+    typesafeUrl: https://api.typesafe.ai/v1/systemone,
+    typesafeModel: jev-latest,
+    typesafeApiKey: "",
     typesafeThreshold: 0.5
   }
   toolsAiConfig: {
