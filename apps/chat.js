@@ -468,7 +468,6 @@ export class ChatPlugin extends plugin {
       const arrivalSeq = this.markTrackingArrival(conversationKey)
 
       // 构建完整格式的用户消息
-      const senderRole = roleMap[e.sender?.role] || "member"
       const senderName = e.sender?.card || e.sender?.nickname || "未知用户"
       const userMessageFormatted = `${this.formatTime()} ${senderName}: ${e.msg || ''}`
 
@@ -708,7 +707,14 @@ export class ChatPlugin extends plugin {
               ? `[用户头像链接: (https://q1.qlogo.cn/g?b=qq&nk=${e.user_id}&s=640)]` : ''
             // 在场成员表（渲染 v3）：QQ 号/群身份在此声明一次，历史行只留短名字引用
             const participantRows = await this.messageManager.getMessages('group', groupId).catch(() => [])
-            const participantsBlock = formatParticipants(extractParticipants(participantRows, botIdForEvent(e), Bot.nickname))
+            // 合入当前发言人（列表拉取失败/消息在窗口外时兜底；插在 bot 之前）
+            const participantList = extractParticipants(participantRows, botIdForEvent(e), Bot.nickname)
+            const currentQQ = String(e?.user_id ?? '')
+            if (currentQQ && !participantList.some(item => item.qq === currentQQ)) {
+              participantList.splice(Math.max(0, participantList.length - 1), 0,
+                { qq: currentQQ, name: e?.sender?.card || e?.sender?.nickname || '未知用户', role: roleTagOf(e?.sender) || '[member]' })
+            }
+            const participantsBlock = formatParticipants(participantList)
             const manager = getV2MessageManager(cacheConfig, { update: false })
             session.cacheTurn = await this.preparePromptCacheTurn({
               e, session, scope, header, userContent: userContent + avatar, manager, allowedTools, agentControls, config: cacheConfig,
@@ -763,7 +769,7 @@ export class ChatPlugin extends plugin {
               .map(msg => ({
                 role: msg.sender.user_id === Bot.uin ? "assistant" : "user",
                 messageId: msg.message_id,
-                content: `[${shortTimeOf(msg.time)}] ${msg.sender.nickname || msg.sender.card || '未知'}${msg.message_id ? `[ID:${msg.message_id}]` : ''}: ${msg.content}`
+                content: `[${shortTimeOf(msg.time)}] ${msg.sender.nickname || msg.sender.card || '未知'}#${String(msg.sender.user_id ?? '').slice(-4)}${msg.message_id ? `[ID:${msg.message_id}]` : ''}: ${msg.content}`
               }))
             )
             groupUserMessages = await Promise.all(groupUserMessages.map(async msg => {
@@ -898,7 +904,6 @@ ${v1Participants}` : '') })
         let chatHistory = activeConv.chatHistory || []
 
         // 添加用户消息
-        const senderRole = roleMap[e.sender?.role] || "member"
         const senderName = e.sender?.card || e.sender?.nickname || "未知用户"
         const userMsg = `${this.formatTime()} ${senderName}: ${(session.userContent || e.msg || '').substring(0, 200)}`
         chatHistory.push({ role: 'user', content: userMsg })

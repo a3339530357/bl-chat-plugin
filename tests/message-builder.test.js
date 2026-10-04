@@ -131,10 +131,10 @@ test("formatReplayEventRow：v2 短格式与 bot 行", () => {
   const user = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37', message_id: '-AbC',
     sender: { user_id: '1107491439', nickname: '小羊可粒', role: 'member' }, content: '你好' } }, '1694409974')
   assert.equal(user.role, 'user')
-  assert.equal(user.content, '[17:46] 小羊可粒[ID:-AbC]: 你好')
+  assert.equal(user.content, '[17:46] 小羊可粒#1439[ID:-AbC]: 你好')
   const admin = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37',
     sender: { user_id: '123', nickname: '老王', role: 'admin' }, content: 'hi' } }, '1694409974')
-  assert.equal(admin.content, '[17:46] 老王: hi')
+  assert.equal(admin.content, '[17:46] 老王#123: hi')
   const bot = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37',
     sender: { user_id: '1694409974', nickname: '哈基米', role: 'member' }, content: '想听啥' } }, '1694409974')
   assert.equal(bot.role, 'assistant')
@@ -164,9 +164,9 @@ test('V2 ordinary assistant history clips once while source and user content rem
 test("渲染 v3：participants 提取与成员表格式", async () => {
   const { extractParticipants, formatParticipants } = await import("../core/messageBuilder.js")
   const rows = [
-    { sender: { user_id: 1107491439, nickname: '小羊可粒', role: 'member' } },
+    { sender: { user_id: 1107491439, nickname: '小羊可粒(新)', role: 'member' } }, // 最新在前：首见即最新昵称
     { sender: { user_id: 3351163616, nickname: '此奶的方子', role: 'owner' } },
-    { sender: { user_id: 1107491439, nickname: '小羊可粒(新)', role: 'member' } }, // 同人新昵称取最新
+    { sender: { user_id: 1107491439, nickname: '小羊可粒', role: 'member' } },      // 旧昵称被跳过
     { sender: { user_id: 1694409974, nickname: '哈基米', role: 'member' } },        // bot 被跳过后单独加入
   ]
   const list = extractParticipants(rows, 1694409974, '哈基米')
@@ -177,7 +177,8 @@ test("渲染 v3：participants 提取与成员表格式", async () => {
   assert.ok(!table.includes('小羊可粒 =') || table.includes('小羊可粒(新)')) // 无重复旧昵称行
 })
 
-test("清洗：v3 短时间格式（HH:MM）记录行同样可整行删", () => {
-  assert.equal(clean("[03:49] 小羊可粒[ID:x]: 以后注意点。"), "")
-  assert.equal(clean("[03:49] 老王[ID:x]: 让让"), "")
+test("清洗：v3 短时间格式（HH:MM）记录行——数字 ID 整行删、字母 ID 保留（日志保护）", () => {
+  assert.equal(clean("[03:49] 小羊可粒[ID:12345]: 以后注意点。"), "")
+  assert.equal(clean("[03:49] 老王[ID:-67890]: 让让"), "")
+  assert.equal(clean("[03:49] worker[ID:job42]: ENOENT /tmp/input"), "[03:49] worker[ID:job42]: ENOENT /tmp/input")
 })

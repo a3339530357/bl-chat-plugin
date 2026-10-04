@@ -38,7 +38,9 @@ export function extractParticipants(rows, botId, botName) {
     if (!sender.user_id || String(sender.user_id) === String(botId)) continue
     const name = sender.card || sender.nickname
     if (!name) continue
-    map.set(String(sender.user_id), { qq: String(sender.user_id), name: String(name), role: roleTagOf(sender) || '[member]' })
+    const key = String(sender.user_id)
+    if (map.has(key)) continue // 输入最新在前：首见即最新昵称/身份，后写不覆盖
+    map.set(key, { qq: key, name: String(name), role: roleTagOf(sender) || '[member]' })
   }
   const list = [...map.values()]
   if (botId != null && botId !== '') {
@@ -60,7 +62,7 @@ export function formatReplayEventRow(event, botId) {
   // 不逐行重复；bot 行 `[昵称][ID:x]: 内容`（ID 保留——「撤回你刚才那句」靠它定位）
   let content = role === 'assistant'
     ? `[${sender.nickname || 'Bot'}]${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
-    : `[${shortTimeOf(message.time)}] ${sender.nickname || sender.card || '未知'}${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
+    : `[${shortTimeOf(message.time)}] ${sender.nickname || sender.card || '未知'}#${String(sender.user_id ?? '').slice(-4)}${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
   if (role === 'assistant' && content.length > 200) content = `${content.substring(0, 200)}...`
   return { role, content }
 }
@@ -161,7 +163,7 @@ export const messageBuilderMethods = {
 ,
   async buildMessageContent(sender, msg, images, atQq = [], group, e = null) {
     const messageId = e?.message_id ? `[ID:${e.message_id}]` : ''
-    const senderInfo = `${sender.card || sender.nickname}${messageId}`
+    const senderInfo = `${sender.card || sender.nickname}#${String(sender.user_id ?? "").slice(-4)}${messageId}`
 
     let atContent = ""
     if (atQq.length > 0 && group) {
@@ -371,7 +373,7 @@ export const messageBuilderMethods = {
             : msg.content
           // 历史回读的 assistant 行可能已带时间/号码包装（V1 持久化格式），不再套第二层——
           // 双层包装会逃过复述清洗（外层昵称前缀剥掉后内层已过 R1/R2 时机）
-          const alreadyWrapped = /^\[(?:\d{4}-\d{2}-\d{2}\s+)?\d{2}:\d{2}:\d{2}\]/.test(msg.content)
+          const alreadyWrapped = /^\[(?:\d{4}-\d{2}-\d{2}\s+)?\d{2}:\d{2}(?::\d{2})?\]/.test(msg.content)
           formattedLines.push(alreadyWrapped ? assistantContent : `[${(typeof Bot !== 'undefined' && Bot.nickname) || 'Bot'}]: ${assistantContent}`)
         }
       }
@@ -425,7 +427,7 @@ export const messageBuilderMethods = {
     const timeClass = '[A-Z]{4}-[A-Z]{2}-[A-Z]{2} [A-Z]{2}:[A-Z]{2}:[A-Z]{2}|[A-Z]{2}-[A-Z]{2} [A-Z]{2}:[A-Z]{2}:[A-Z]{2}|\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}|\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}|\\d{2}:\\d{2}:\\d{2}|\\d{2}:\\d{2}'
     const named = `[^(\n]+\\((?:(?:QQ号|qq号)[:：][ \\t]*)?\\d+\\)`
     // 渲染 v3：消息行无 QQ 括号，名字后直接跟 [ID:x]/[管理] 标签——标签本身即记录行证据
-    const namedV3 = `[^(\n\\[]+(?:\\[${tagClass}\\])+`
+    const namedV3 = `[^\\[]+?(?:\\[ID:-?\\d+\\]|\\[管理\\]|\\[群主\\])`
 
     // 第 1 步 bot 行前缀剥离（必须最先：趁 markdown 转换未拆坏特殊昵称，且剥掉外层后
     // 内层记录行还能被后续 R1/R2 清洗——修 V1 双层包装逃逸）

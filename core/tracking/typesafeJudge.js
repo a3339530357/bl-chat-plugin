@@ -99,7 +99,7 @@ export async function typesafeBatchJudge(config, batch) {
   }
 
   const result = await typesafeRequest(config, {
-    state: { bot: { name: botName, qq: String(botUin) }, messages },
+    state: { bot: { name: botName, qq: String(botUin) }, participants, messages },
     model: config.typesafeModel || 'jev-latest',
     questions
   })
