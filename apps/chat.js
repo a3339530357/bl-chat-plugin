@@ -19,7 +19,7 @@ import { configManagerMethods } from "../core/configManager.js"
 import { taskStatusMethods } from "../core/taskStatus.js"
 import { toolHistoryMethods } from "../core/toolHistory.js"
 import { tryAutoGrabRedBag } from "../core/redBag.js"
-import { messageBuilderMethods, roleMap, shortTimeOf, roleTagOf, extractParticipants, formatParticipants } from "../core/messageBuilder.js"
+import { messageBuilderMethods, roleMap, shortTimeOf, roleTagOf, extractParticipants, formatParticipants, displayNameFor } from "../core/messageBuilder.js"
 import { conversationTrackerMethods, activeConversations, trackingThrottle } from "../core/conversationTracker.js"
 import { replySenderMethods } from "../core/replySender.js"
 import { toolExecutorMethods } from "../core/toolExecutor.js"
@@ -769,7 +769,7 @@ export class ChatPlugin extends plugin {
               .map(msg => ({
                 role: msg.sender.user_id === Bot.uin ? "assistant" : "user",
                 messageId: msg.message_id,
-                content: `[${shortTimeOf(msg.time)}] ${msg.sender.nickname || msg.sender.card || '未知'}#${String(msg.sender.user_id ?? '').slice(-4)}${msg.message_id ? `[ID:${msg.message_id}]` : ''}: ${msg.content}`
+                content: `[${shortTimeOf(msg.time)}] ${displayNameFor(msg.sender.nickname || msg.sender.card || '未知', msg.sender.user_id)}${msg.message_id ? `[ID:${msg.message_id}]` : ''}: ${msg.content}`
               }))
             )
             groupUserMessages = await Promise.all(groupUserMessages.map(async msg => {

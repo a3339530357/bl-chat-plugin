@@ -127,14 +127,20 @@ test("processToolSpecificMessage：兜底②损坏裸标签不跨行吞正文", 
   assert.equal(clean("[ID:x\n这里是正常正文\n[注意]: 请勿重启服务"), "[ID:x\n这里是正常正文\n[注意]: 请勿重启服务")
 })
 
-test("formatReplayEventRow：v2 短格式与 bot 行", () => {
+test("formatReplayEventRow：v3 短格式与 bot 行", () => {
   const user = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37', message_id: '-AbC',
-    sender: { user_id: '1107491439', nickname: '小羊可粒', role: 'member' }, content: '你好' } }, '1694409974')
+    sender: { user_id: '1107491439', nickname: '独占昵称甲', role: 'member' }, content: '你好' } }, '1694409974')
   assert.equal(user.role, 'user')
-  assert.equal(user.content, '[17:46] 小羊可粒#1439[ID:-AbC]: 你好')
+  assert.equal(user.content, '[17:46] 独占昵称甲[ID:-AbC]: 你好')
   const admin = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37',
-    sender: { user_id: '123', nickname: '老王', role: 'admin' }, content: 'hi' } }, '1694409974')
-  assert.equal(admin.content, '[17:46] 老王#123: hi')
+    sender: { user_id: '123', nickname: '孤独老王', role: 'admin' }, content: 'hi' } }, '1694409974')
+  assert.equal(admin.content, '[17:46] 孤独老王: hi')
+  // 重名检测：同名第二人入账后，双方行都带 #尾4 后缀
+  formatReplayEventRow({ message: { time: '2026-10-04 17:47:37', message_id: '100',
+    sender: { user_id: '1107491439', nickname: '撞名', role: 'member' }, content: '我是第一个' } }, '1694409974')
+  const dupe2 = formatReplayEventRow({ message: { time: '2026-10-04 17:48:37', message_id: '101',
+    sender: { user_id: '3351163616', nickname: '撞名', role: 'member' }, content: '我是第二个' } }, '1694409974')
+  assert.equal(dupe2.content, '[17:48] 撞名#3616[ID:101]: 我是第二个')
   const bot = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37',
     sender: { user_id: '1694409974', nickname: '哈基米', role: 'member' }, content: '想听啥' } }, '1694409974')
   assert.equal(bot.role, 'assistant')

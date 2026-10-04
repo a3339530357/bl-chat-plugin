@@ -49,6 +49,19 @@ export function extractParticipants(rows, botId, botName) {
   return list
 }
 
+// 昵称→QQ 注册表（进程级）：重名检测——同一昵称被多人使用时，消息行才加 #尾4 后缀；
+// 独占昵称的人永远裸名（省 token）。重启清零后重新注册，重名在第二人入账时恢复标记
+const nicknameOwners = new Map()
+export function displayNameFor(name, qq) {
+  const key = String(name ?? '')
+  const id = String(qq ?? '')
+  if (!key || !id) return name || '未知'
+  let owners = nicknameOwners.get(key)
+  if (!owners) { owners = new Set(); nicknameOwners.set(key, owners) }
+  owners.add(id)
+  return owners.size > 1 ? `${name}#${id.slice(-4)}` : name
+}
+
 export function formatParticipants(list) {
   return (list || []).map(p => `${p.name} = QQ ${p.qq} ${p.role}`).join('\n')
 }
@@ -62,7 +75,7 @@ export function formatReplayEventRow(event, botId) {
   // 不逐行重复；bot 行 `[昵称][ID:x]: 内容`（ID 保留——「撤回你刚才那句」靠它定位）
   let content = role === 'assistant'
     ? `[${sender.nickname || 'Bot'}]${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
-    : `[${shortTimeOf(message.time)}] ${sender.nickname || sender.card || '未知'}#${String(sender.user_id ?? '').slice(-4)}${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
+    : `[${shortTimeOf(message.time)}] ${displayNameFor(sender.nickname || sender.card || '未知', sender.user_id)}${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
   if (role === 'assistant' && content.length > 200) content = `${content.substring(0, 200)}...`
   return { role, content }
 }
@@ -163,7 +176,7 @@ export const messageBuilderMethods = {
 ,
   async buildMessageContent(sender, msg, images, atQq = [], group, e = null) {
     const messageId = e?.message_id ? `[ID:${e.message_id}]` : ''
-    const senderInfo = `${sender.card || sender.nickname}#${String(sender.user_id ?? "").slice(-4)}${messageId}`
+    const senderInfo = `${displayNameFor(sender.card || sender.nickname, sender.user_id)}${messageId}`
 
     let atContent = ""
     if (atQq.length > 0 && group) {
