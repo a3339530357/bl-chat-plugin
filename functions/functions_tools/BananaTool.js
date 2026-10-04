@@ -18,7 +18,7 @@ export class BananaTool extends AbstractTool {
   constructor() {
     super();
     this.name = 'bananaTool';
-    this.description = '根据提示词生成图片, 使用nano-banana-2模型进行绘图';
+    this.description = '这是你本人的画图技能：根据文字描述生成一张图片。群里有人让你画图/画个xx/生成图片/来张图时直接调用，绝不要说"我不会画画""画不出来"——你会画。'
     this.parameters = {
       type: 'object',
       properties: {
