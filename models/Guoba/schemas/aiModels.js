@@ -37,6 +37,18 @@ export default [
     "gpt-4o-mini",
     "用于会话追踪时判断用户是否在和 bot 继续对话，推荐快速小模型"
   ),
+  {
+    component: "Select",
+    label: "判定通道 judgeProvider",
+    field: "trackAiConfig.judgeProvider",
+    bottomHelpMessage: "strict 批量判断与 smart Gate 插话判定共用的判定模型通道。typesafe=TypeSafe Jev 校准概率（配置 trackAiConfig.typesafeApiKey，失败自动回退 flash）；flash=原文本判定。切换后需重启 Yunzai 生效",
+    componentProps: {
+      options: [
+        { label: "TypeSafe Jev（校准概率，失败自动回退 flash）", value: "typesafe" },
+        { label: "Flash 文本判定（原行为）", value: "flash" }
+      ]
+    }
+  },
   ...makeAiBlock(
     "工具决策 toolsAiConfig",
     "toolsAiConfig",
