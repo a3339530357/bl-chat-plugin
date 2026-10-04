@@ -3,6 +3,7 @@
 // 以 mixin 形式挂到插件原型上，this 指向插件实例。
 import { callAI } from "../../utils/apiClient.js"
 import { typesafeBatchJudge } from "./typesafeJudge.js"
+import { judgmentPreview, writeJudgmentLog } from './judgmentLog.js'
 
 // 会话追踪: key: `${groupId}_${userId}`, value: { lastActiveTime, chatHistory: [], timer: null }
 // （handleRandomReply / handleTextResponse 也会读写，故导出）
@@ -19,6 +20,10 @@ let batchTimer = null // 批量处理定时器
 // strict 追踪判断 / smart Gate 的 trackAi 调用超时（毫秒）。
 // trackAi 中转卡住时，避免 addToBatchJudgment 的 Promise 永不 resolve 导致处理协程泄漏。
 const TRACK_AI_TIMEOUT_MS = 15000
+
+function logStrictJudgment(item, result, provider, probability = null) {
+  writeJudgmentLog('info', `[批量判断][${provider}] g=${item.e?.group_id ?? 'g'} u=${item.e?.user_id ?? 'unknown'} ${judgmentPreview(item.e, item.userMessage)} → ${probability === null ? 'n/a' : probability.toFixed(2)} (${Boolean(result)})`)
+}
 
 export const strictTrackingMethods = {
   /**
@@ -181,6 +186,7 @@ export const strictTrackingMethods = {
     if (pendingJudgments.length === 0) return
 
     const batch = pendingJudgments.splice(0)
+    let flashProvider = 'flash'
 
     // TypeSafe (Jev) 判定通道：trackAiConfig.judgeProvider === 'typesafe' 时启用；
     // 任何失败（网络/HTTP/解析）自动回退下方 flash 文本判定链，不放大故障
@@ -192,30 +198,39 @@ export const strictTrackingMethods = {
           senderName: item.e?.sender?.card || item.e?.sender?.nickname || '未知用户'
         }))
         const { probabilities, threshold } = await typesafeBatchJudge(this.config.trackAiConfig, batchWithIds)
-        logger.info(`[批量判断][typesafe] ${batch.length}条，概率: ${JSON.stringify(probabilities)} (阈值${threshold})`)
         // 全部命中 → 按概率出结果；任一缺失/无效值（含越界概率）→ 整批回退 flash，避免同批混用两种判定口径
         if (batchWithIds.every(item => typeof probabilities[item.id] === 'number')) {
-          batchWithIds.forEach(item => item.resolve(probabilities[item.id] >= threshold))
+          batchWithIds.forEach(item => {
+            const result = probabilities[item.id] >= threshold
+            logStrictJudgment(item, result, 'typesafe', probabilities[item.id])
+            item.resolve(result)
+          })
           return
         }
-        logger.warn('[批量判断][typesafe] 存在缺失判定项，回退 flash 通道')
+        writeJudgmentLog('warn', '[批量判断][typesafe] 存在缺失判定项，未采用 Jev 结果，整批回退 fallback-flash')
       } catch (error) {
-        logger.warn('[批量判断][typesafe] 失败，回退 flash 通道:', error.message)
+        writeJudgmentLog('warn', `[批量判断][typesafe] 失败，未采用 Jev 结果，整批回退 fallback-flash: ${JSON.stringify(error.message)}`)
       }
+      flashProvider = 'fallback-flash'
     }
 
     if (batch.length === 1) {
       const result = await this.isUserTalkingToBot(batch[0].userMessage, batch[0].chatHistory)
+      logStrictJudgment(batch[0], result, flashProvider)
       batch[0].resolve(result)
       return
     }
 
     try {
       const results = await this.batchIsUserTalkingToBot(batch)
-      batch.forEach((item, i) => item.resolve(results[i] || false))
+      batch.forEach((item, i) => {
+        const result = results[i] || false
+        logStrictJudgment(item, result, flashProvider)
+        item.resolve(result)
+      })
     } catch (error) {
       logger.error('[批量判断] 失败:', error)
-      batch.forEach(item => item.resolve(false))
+      batch.forEach(item => { logStrictJudgment(item, false, flashProvider); item.resolve(false) })
     }
   },
 

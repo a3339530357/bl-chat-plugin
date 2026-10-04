@@ -7,6 +7,8 @@ import { prefilterMessage as prefilterMessagePure } from "../prefilter.js"
 import { CompletedEventCache, getSmartEventKey, resolveWaitReplyAction } from "../waitReplyPolicy.js"
 import { callAI } from "../../utils/apiClient.js"
 import { mutedStatusCache, MUTED_CACHE_TTL_MS } from "./mutedStatus.js"
+import { typesafeGateJudge } from './typesafeJudge.js'
+import { judgmentPreview, writeJudgmentLog } from './judgmentLog.js'
 
 // smart 模式：每群独立的频率状态，进程内 Map，重启清零
 const trackingChatStates = new Map() // groupId -> { pendingCount, lastMsgAt, replyLatencies: [{at, ms}], forceContinue, forceGateCheck, lastGateNoActionAt, inFlight, waitTimers: Map<userKey, timeoutId> }
@@ -15,6 +17,23 @@ const lastIncomingMsgAt = new Map() // groupId -> ts
 // 群连续被新消息打断的累计计数（达到上限后下一轮强制走完不再让步）
 const consecutiveInterrupts = new Map() // groupId -> count
 let activeChatLruTimer = null // 全局 24h LRU 扫描定时器，进程内单例
+
+function logGateJudgment(e, result, startedAt) {
+  const probability = result.probabilities
+  const distribution = probability ? ` [cont ${probability.continue.toFixed(2)}/no ${probability.no_action.toFixed(2)}/wait ${probability.wait.toFixed(2)}]` : ''
+  const selected = probability ? probability[result.rawChoice].toFixed(2) : 'n/a'
+  const decision = result.rawChoice && result.rawChoice !== result.decision
+    ? `raw=${result.rawChoice} p=${selected} final=${result.decision} reason=${result.reason}`
+    : `${result.decision} (${selected})`
+  writeJudgmentLog('info', `[Gate][${result.provider || 'flash'}] g=${e.group_id} u=${e.user_id} ${judgmentPreview(e)} → ${decision}${distribution}${result.decision === 'wait' ? ` wait=${result.wait_seconds}s` : ''} ${Date.now() - startedAt}ms`)
+}
+
+function limitGateWait(e, state, result) {
+  if (result?.decision !== 'wait' || e._smartWaitKind !== 'gate' ||
+      e._smartGateWaitVersion !== (state.groupContextVersion || 0)) return result
+  return { ...result, rawChoice: result.rawChoice || 'wait', decision: 'no_action',
+    finalDecision: 'no_action', reason: 'gate_wait_recheck_limit' }
+}
 
 export const smartGateMethods = {
   /**
@@ -404,7 +423,8 @@ export const smartGateMethods = {
       try {
         // 强制继续路径直接放行，跳过 Gate；强制 Gate 路径仍交给 Gate 判断是否补一句
         if (state.forceContinue) {
-          gateResult = { decision: 'continue', reason: 'force', __forceContinue: true }
+          gateResult = { decision: 'continue', reason: 'force', __forceContinue: true, provider: 'local-force' }
+          logGateJudgment(e, gateResult, Date.now())
         } else {
           gateResult = await this.runTimingGate(e, state, { phase, prefilter, threshold, prevLastMsgAt })
         }
@@ -413,6 +433,12 @@ export const smartGateMethods = {
         gateResult = { decision: 'no_action', reason: 'error' }
       }
 
+      // A Gate wait gets one reevaluation without new group input. Tool waits are independent.
+      const limitedGateResult = limitGateWait(e, state, gateResult)
+      if (limitedGateResult !== gateResult) {
+        gateResult = limitedGateResult
+        logGateJudgment(e, gateResult, Date.now())
+      }
       const decision = gateResult?.decision || 'no_action'
       logger.info(`[TimingGate] group=${groupId} decision=${decision} phase=${phase} pending=${state.pendingCount}/${threshold} forceContinue=${state.forceContinue} forceGate=${state.forceGateCheck} reason=${gateResult?.reason || ''}`)
 
@@ -536,42 +562,46 @@ export const smartGateMethods = {
    * @param ctx 额外上下文：{ phase, prefilter, threshold }
    */
   async runTimingGate(e, state, ctx = {}) {
-    const smartCfg = this.config.smartTrigger || {}
+    const startedAt = Date.now()
+    const smartCfg = { ...this.config.smartTrigger }
     const ctxSize = Math.max(5, Math.min(100, Number(smartCfg.gateContextSize) || 20))
     const botName = Bot.nickname || '机器人'
-
-    let history = ''
-    try {
-      history = await this.messageManager.formatMessageHistory('group', e.group_id, ctxSize)
-    } catch { history = '(无)' }
+    const currentMessage = {
+      sender: { name: e.sender?.card || e.sender?.nickname || '用户', qq: String(e.user_id ?? '') },
+      messageId: e.message_id ?? null, text: String(e.msg || ''),
+      message: Array.isArray(e.message) ? e.message.map(segment => ({ ...segment })) : []
+    }
+    const logEvent = { group_id: e.group_id, user_id: e.user_id, msg: currentMessage.text }
 
     // Gate 子代理复用 trackAiConfig（同样是"轻量 LLM 决策回不回话"用途，不再单独配置一份模型）
-    const trackCfg = this.config.trackAiConfig
+    const trackCfg = { ...this.config.trackAiConfig }
     const useCfg = {
       url: trackCfg?.trackAiUrl,
       model: trackCfg?.trackAiModel || 'gpt-4o-mini',
       apikey: trackCfg?.trackAiApikey
     }
-    if (!useCfg.url || !useCfg.apikey || String(useCfg.apikey).startsWith('sk-xxxxx')) {
-      return { decision: 'no_action', reason: 'no_api_config' }
+    const finish = result => {
+      const effective = limitGateWait(e, state, result)
+      logGateJudgment(logEvent, effective, startedAt)
+      return effective
     }
 
     // ─── 多维信号采集 ─────────────────────────────────────
     const phase = ctx.phase || state.conversationPhase || 'cold'
     const prefilterKind = ctx.prefilter?.kind || 'regular'
     const prefilterReason = ctx.prefilter?.reason || ''
-    const recentReplyCount = (state.recentReplyTimestamps || []).filter(t => t > Date.now() - 600000).length
+    const recentReplyCount = (state.recentReplyTimestamps || []).filter(t => t > startedAt - 600000).length
     const groupMsgRate5min = this.computeGroupMsgRate5min(state)
     const sinceLastBotReplySec = state.lastBotReplyAt
-      ? Math.max(0, Math.floor((Date.now() - state.lastBotReplyAt) / 1000))
+      ? Math.max(0, Math.floor((startedAt - state.lastBotReplyAt) / 1000))
       : -1
     // 用入口处保存的"上一条消息时间"（state.lastMsgAt 在入口已被更新为当前消息时间，
     // 直接用会导致这个信号恒为 0s）
     const prevMsgAt = Number(ctx.prevLastMsgAt) || state.lastMsgAt
     const sinceLastMsgSec = prevMsgAt
-      ? Math.max(0, Math.floor((Date.now() - prevMsgAt) / 1000))
+      ? Math.max(0, Math.floor((startedAt - prevMsgAt) / 1000))
       : 0
-    const now = new Date()
+    const now = new Date(startedAt)
     const hh = now.getHours()
     const hhmm = `${String(hh).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
     const isLateNight = hh >= 23 || hh < 6
@@ -598,8 +628,45 @@ export const smartGateMethods = {
     const promptHintBusyGroupRate = Number(smartCfg.promptHintBusyGroupRate) || 30
     const promptHintRateLimitWarn = Number(smartCfg.promptHintRateLimitWarn) || 5
 
+    const specialSignals = []
+    if (addressedToOther) specialSignals.push('⚠ 当前消息 @ 了别人，谨慎插话')
+    if (currentMsgQuotesBot) specialSignals.push(`✓ 当前消息引用了 ${botName} 的某条消息`)
+    let rawHistory = null
+    let provider = 'flash'
+    if (String(trackCfg.judgeProvider || '').trim().toLowerCase() === 'typesafe') {
+      const payload = {
+        asOf: now.toISOString(), bot: { name: botName, qq: String(e.self_id ?? e.bot?.uin ?? Bot.uin) },
+        currentMessage,
+        timing: { sinceLastMessageSec: sinceLastMsgSec, sinceLastBotReplySec: sinceLastBotReplySec >= 0 ? sinceLastBotReplySec : null },
+        activity: { replies10min: recentReplyCount, messages5min: groupMsgRate5min },
+        conversation: { phase, focusReplyCount: state.focusReplyCount || 0 },
+        trigger: { kind: e._smartWaitKind ? 'wait_reevaluation' : e._deferredReason ? 'deferred' : e._smartWaitRerun ? 'wait_reevaluation' : prefilterKind,
+          reason: e._smartWaitKind ? `${e._smartWaitKind}_wait` : e._deferredReason || prefilterReason,
+          waitKind: e._smartWaitKind || null, isRealMessage: !e._smartWaitRerun && !e._smartQueuedRerun && !e._proactiveReply,
+          newMessageSinceWait: e._smartWaitKind === 'gate' && e._smartGateWaitVersion !== (state.groupContextVersion || 0),
+          groupContextVersion: state.groupContextVersion || 0, pendingCount: state.pendingCount || 0, messageThreshold: ctx.threshold },
+        signals: { addressedToOther, quotesBot: currentMsgQuotesBot, special: specialSignals },
+        policy: { promptHintBusyGroupRate, promptHintRateLimitWarn }
+      }
+      try {
+        rawHistory = await this.messageManager.getMessages('group', e.group_id, { strict: true })
+        const result = await typesafeGateJudge(trackCfg, { ...payload, history: rawHistory.slice(0, ctxSize) })
+        return finish(result)
+      } catch (error) {
+        provider = 'fallback-flash'
+        writeJudgmentLog('warn', `[Gate][fallback-flash] g=${e.group_id} u=${e.user_id} ${judgmentPreview(logEvent)} Jev 失败: ${JSON.stringify(error.message)}`)
+      }
+    }
+    if (!useCfg.url || !useCfg.apikey || String(useCfg.apikey).startsWith('sk-xxxxx')) {
+      return finish({ decision: 'no_action', reason: 'no_api_config', provider })
+    }
+    let history = ''
+    try {
+      history = await this.messageManager.formatMessageHistory('group', e.group_id, ctxSize, rawHistory)
+    } catch { history = '(无)' }
+
     const systemPrompt = `你是 QQ 群聊节奏判断助手。机器人名字叫"${botName}"。
-当前北京时间：${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}
+当前北京时间：${now.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}
 你需要判断 ${botName} 是否应该现在插话、保持沉默、或稍后再说。
 
 **总原则：${botName} 是群里的活跃成员，看到感兴趣/有共鸣/能玩梗的话题就应该自然参与**。
@@ -624,16 +691,13 @@ export const smartGateMethods = {
 只返回严格的 JSON，格式：{"decision":"continue|no_action|wait","wait_seconds":3,"reason":"简短理由"}
 wait 时 wait_seconds 取 3-15 之间。不要任何其他文字、不要 markdown、不要代码块包装。`
 
-    const specialSignals = []
-    if (addressedToOther) specialSignals.push('⚠ 当前消息 @ 了别人，谨慎插话')
-    if (currentMsgQuotesBot) specialSignals.push(`✓ 当前消息引用了 ${botName} 的某条消息`)
     const specialSignalsBlock = specialSignals.length ? `\n【特殊信号】\n${specialSignals.join('\n')}\n` : ''
 
     const userPrompt = `【近期群聊记录】
 ${history}
 
 【当前消息】
-${e.sender?.card || e.sender?.nickname || '用户'}: ${e.msg || ''}
+${currentMessage.sender.name}: ${currentMessage.text}
 
 【时间与活跃度】
 - 距上一条群消息：${sinceLastMsgSec}s
@@ -663,23 +727,23 @@ ${specialSignalsBlock}
         }
       )
 
-      if (result.error) return { decision: 'no_action', reason: `api_error:${result.error}` }
+      if (result.error) return finish({ decision: 'no_action', reason: `api_error:${result.error}`, provider })
 
       const raw = result?.choices?.[0]?.message?.content?.trim() || ''
       const jsonMatch = raw.match(/\{[\s\S]*\}/)
-      if (!jsonMatch) return { decision: 'no_action', reason: 'no_json' }
+      if (!jsonMatch) return finish({ decision: 'no_action', reason: 'no_json', provider })
       const parsed = JSON.parse(jsonMatch[0])
       const dec = String(parsed.decision || '').toLowerCase()
       if (!['continue', 'no_action', 'wait'].includes(dec)) {
-        return { decision: 'no_action', reason: 'invalid_decision' }
+        return finish({ decision: 'no_action', reason: 'invalid_decision', provider })
       }
-      return {
+      return finish({
         decision: dec,
         wait_seconds: Number(parsed.wait_seconds) || 5,
-        reason: String(parsed.reason || '').slice(0, 80)
-      }
+        reason: String(parsed.reason || '').slice(0, 80), provider
+      })
     } catch (err) {
-      return { decision: 'no_action', reason: `exception:${err.message}` }
+      return finish({ decision: 'no_action', reason: `exception:${err.message}`, provider })
     } finally {
       clearTimeout(timeoutId)
     }
@@ -766,6 +830,8 @@ ${specialSignalsBlock}
         const wrapped = Object.create(targetEvent)
         wrapped._smartWaitRerun = true
         wrapped._proactiveReply = true
+        wrapped._smartWaitKind = waitKind
+        if (waitKind === 'gate') wrapped._smartGateWaitVersion = scheduledGroupVersion
         await this.handleRandomReplySmart(wrapped)
       } catch (err) {
         logger.error(`[WaitTool] 续话失败:`, err)

@@ -200,7 +200,8 @@ pluginSettings:
     typesafeUrl: https://api.typesafe.ai/v1/systemone,
     typesafeModel: jev-latest,
     typesafeApiKey: "",
-    typesafeThreshold: 0.5
+    typesafeThreshold: 0.5,
+    typesafeGateThreshold: 0.5
   }
   toolsAiConfig: {
     toolsAiUrl: https://api.openai.com/v1/chat/completions,

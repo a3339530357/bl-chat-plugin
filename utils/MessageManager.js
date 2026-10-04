@@ -568,11 +568,12 @@ export class MessageManager {
    * @param {string} type 消息类型 (private/group)
    * @param {number} id 用户ID或群ID
    * @param {number} limit 限制返回的消息数量
+   * @param {Array|null} snapshot 可选的只读倒序快照，供判定回退复用原历史
    * @returns {Promise<string>} 格式化后的消息历史文本
    */
-  async formatMessageHistory(type, id, limit = null) {
+  async formatMessageHistory(type, id, limit = null, snapshot = null) {
     try {
-      let messages = await this.getMessages(type, id);
+      let messages = snapshot ?? await this.getMessages(type, id);
 
       if (messages.length === 0) {
         return '暂无消息记录';
