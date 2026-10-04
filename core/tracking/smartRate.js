@@ -23,7 +23,9 @@ export const smartRateMethods = {
     const smartCfg = this.config.smartTrigger || {}
     const cutoff = Date.now() - 600000
     state.recentReplyTimestamps = (state.recentReplyTimestamps || []).filter(t => t > cutoff)
-    const maxPer10Min = Number(smartCfg.maxRepliesPer10Min) || 8
+    // 0=不限制（显式关闭防刷屏上限）；未配置/非法值回落默认 8
+    const raw = Number(smartCfg.maxRepliesPer10Min)
+    const maxPer10Min = raw === 0 ? Infinity : (raw || 8)
     if (state.recentReplyTimestamps.length >= maxPer10Min) {
       logger.info(`[RateLimit] group=${groupId} 10min 已回复 ${state.recentReplyTimestamps.length}/${maxPer10Min} 次，强制 no_action`)
       state.conversationPhase = 'fading'

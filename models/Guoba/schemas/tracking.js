@@ -260,8 +260,8 @@ export default [
     field: "smartTrigger.maxRepliesPer10Min",
     label: "10 分钟内最多主动说几次",
     component: "InputNumber",
-    bottomHelpMessage: "任意 10 分钟内它最多主动插话几次（默认 8）。被@/被叫的必回不受此限",
-    componentProps: { min: 1, max: 30, placeholder: "8" }
+    bottomHelpMessage: "任意 10 分钟内它最多主动插话几次（默认 8）。被@/被叫的必回不受此限。0=不限制",
+    componentProps: { min: 0, max: 30, placeholder: "8" }
   },
   {
     field: "smartTrigger.rateLimitCooldownMs",
