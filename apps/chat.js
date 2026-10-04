@@ -444,9 +444,6 @@ export class ChatPlugin extends plugin {
 
     // 在追踪期内，判断是否在继续对话
     if (this.config.conversationTrackingEnabled && activeConv) {
-      // 登记本条消息序号：连发时后一条会拿到更大序号，使前一条的回复去抖检测到"还有新消息"而让步
-      const arrivalSeq = this.markTrackingArrival(conversationKey)
-
       // 群并发已满时提前让步，避免白白消耗一次"是否在跟 bot 对话"的判定 API
       if (this.isGroupChatAtCapacity(e.group_id)) {
         const { active, limit } = this.getGroupChatConcurrency(e.group_id)
@@ -465,6 +462,10 @@ export class ChatPlugin extends plugin {
 
       // 更新节流时间
       trackingThrottle.set(throttleKey, Date.now())
+
+      // 登记本条消息序号（须在节流/并发过滤之后：被丢弃的消息若也刷新序号，
+      // 前一条的去抖会让位给一条永远不会进判断流程的消息，导致回复丢失——已踩坑修复）
+      const arrivalSeq = this.markTrackingArrival(conversationKey)
 
       // 构建完整格式的用户消息
       const senderRole = roleMap[e.sender?.role] || "member"

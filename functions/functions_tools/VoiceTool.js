@@ -1,4 +1,7 @@
 import { AbstractTool } from './AbstractTool.js';
+import fs from "fs"
+import path from "path"
+import YAML from "yaml"
 // VoiceTool.js
 export class VoiceTool extends AbstractTool {
   constructor() {
@@ -21,6 +24,38 @@ export class VoiceTool extends AbstractTool {
 
   async func(opts, e) {
     const { text } = opts;
+
+    // SiliconFlow CosyVoice2 TTS（2026-10-04 换源：原魔搭 AI-jiaran 接口已 404 下线）
+    // 配置在插件自身 config/message.yaml 的 voiceAiConfig（与 imageEditAiConfig 同模式）
+    try {
+      const cfg = this.loadConfig().voiceAiConfig || {}
+      if (!cfg.ttsApiKey) return '发送语音失败: 未配置 voiceAiConfig.ttsApiKey'
+      const response = await fetch(cfg.ttsApiUrl || 'https://api.siliconflow.cn/v1/audio/speech', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${cfg.ttsApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: cfg.ttsModel || 'FunAudioLLM/CosyVoice2-0.5B',
+          input: text,
+          voice: cfg.ttsVoice || 'FunAudioLLM/CosyVoice2-0.5B:claire',
+          response_format: 'mp3'
+        })
+      })
+      if (!response.ok) {
+        return `发送语音失败: TTS接口 HTTP ${response.status}`
+      }
+      const buffer = Buffer.from(await response.arrayBuffer())
+      const { randomUUID } = await import('crypto')
+      const tmpFile = `/root/tmp/voice-${randomUUID().slice(0, 8)}.mp3`
+      fs.writeFileSync(tmpFile, buffer)
+      await e.reply(segment.record(`file://${tmpFile}`))
+      return `发送语音内容(${text})成功，你已经发送语音了，所以不需要强调你已经发送语音，继续说之后的事情，回复的文字内容不要和语音内容重合`
+    } catch (error) {
+      return `发送语音失败: ${error.message}`
+    }
+    /* 原魔搭实现（接口已下线，保留备查）
 
     // try {
     //   const resData = await Bot.sendApi('send_group_ai_record', {
@@ -76,5 +111,12 @@ export class VoiceTool extends AbstractTool {
     } catch (error) {
       return `发送语音失败: ${error.message}`;
     }
+    */
+  }
+
+  // 加载配置（与 BananaTool 同模式）
+  loadConfig() {
+    const configPath = path.join(process.cwd(), 'plugins/bl-chat-plugin/config/message.yaml')
+    return YAML.parse(fs.readFileSync(configPath, 'utf8')).pluginSettings
   }
 }
