@@ -106,6 +106,23 @@ test("processToolSpecificMessage：特殊昵称（含 markdown 元字符）不�
   } finally { delete globalThis.Bot }
 })
 
+test("processToolSpecificMessage：损坏 ID 标签不跨行吞下一行标题", () => {
+  // 损坏残行原样留存（无闭合标签无可判形状），关键是下一行通知不被吸入
+  assert.equal(clean("[17:46:37] 小羊(123)[ID:x\n[注意]: 请勿重启服务"), "[17:46:37] 小羊(123)[ID:x\n[注意]: 请勿重启服务")
+})
+
+test("processToolSpecificMessage：markdown 转换拼出的 bot 前缀补清洗", () => {
+  globalThis.Bot = { nickname: '哈基米' }
+  try {
+    assert.equal(clean("[[哈基米]: 内容](https://example.com/a)"), "内容\n- https://example.com/a")
+  } finally { delete globalThis.Bot }
+})
+
+test("processToolSpecificMessage：markdown 定义的尖括号与相对路径形式不受兜底剥", () => {
+  assert.equal(clean("[ID:abc]: <https://example.com/a>"), "[ID:abc]: <https://example.com/a>")
+  assert.equal(clean("[ID:abc]: ./docs/file.md"), "[ID:abc]: ./docs/file.md")
+})
+
 test("formatReplayEventRow：v2 短格式与 bot 行", () => {
   const user = formatReplayEventRow({ message: { time: '2026-10-04 17:46:37', message_id: '-AbC',
     sender: { user_id: '1107491439', nickname: '小羊可粒', role: 'member' }, content: '你好' } }, '1694409974')
