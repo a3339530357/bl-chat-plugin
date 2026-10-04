@@ -19,7 +19,7 @@ import { configManagerMethods } from "../core/configManager.js"
 import { taskStatusMethods } from "../core/taskStatus.js"
 import { toolHistoryMethods } from "../core/toolHistory.js"
 import { tryAutoGrabRedBag } from "../core/redBag.js"
-import { messageBuilderMethods, roleMap, shortTimeOf, roleTagOf } from "../core/messageBuilder.js"
+import { messageBuilderMethods, roleMap, shortTimeOf, roleTagOf, extractParticipants, formatParticipants } from "../core/messageBuilder.js"
 import { conversationTrackerMethods, activeConversations, trackingThrottle } from "../core/conversationTracker.js"
 import { replySenderMethods } from "../core/replySender.js"
 import { toolExecutorMethods } from "../core/toolExecutor.js"
@@ -470,7 +470,7 @@ export class ChatPlugin extends plugin {
       // 构建完整格式的用户消息
       const senderRole = roleMap[e.sender?.role] || "member"
       const senderName = e.sender?.card || e.sender?.nickname || "未知用户"
-      const userMessageFormatted = `${this.formatTime()} ${senderName}(${e.user_id})${senderRole === 'admin' ? '[管理]' : senderRole === 'owner' ? '[群主]' : ''}: ${e.msg || ''}`
+      const userMessageFormatted = `${this.formatTime()} ${senderName}: ${e.msg || ''}`
 
       // 使用批量判断队列
       const isTalking = await this.addToBatchJudgment(conversationKey, userMessageFormatted, activeConv.chatHistory || [], e)
@@ -706,11 +706,15 @@ export class ChatPlugin extends plugin {
             }
             const avatar = cacheConfig.forcedAvatarMode && msg?.includes('头像编辑')
               ? `[用户头像链接: (https://q1.qlogo.cn/g?b=qq&nk=${e.user_id}&s=640)]` : ''
+            // 在场成员表（渲染 v3）：QQ 号/群身份在此声明一次，历史行只留短名字引用
+            const participantRows = await this.messageManager.getMessages('group', groupId).catch(() => [])
+            const participantsBlock = formatParticipants(extractParticipants(participantRows, botIdForEvent(e), Bot.nickname))
             const manager = getV2MessageManager(cacheConfig, { update: false })
             session.cacheTurn = await this.preparePromptCacheTurn({
               e, session, scope, header, userContent: userContent + avatar, manager, allowedTools, agentControls, config: cacheConfig,
               references: {
                 '北京时间': "北京时间: " + new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }),
+                '今日在场成员': participantsBlock ? `发言人身份与QQ号（按昵称查询，戳人/禁言等需要QQ号时查此表）：\n${participantsBlock}` : '',
                 '角色状态': enhancedPrompts, '工具调用历史': toolHistoryPrompt,
                 '群公告': groupContext.groupNotice, 'MCP扩展能力': mcpPrompts
               }
@@ -759,7 +763,7 @@ export class ChatPlugin extends plugin {
               .map(msg => ({
                 role: msg.sender.user_id === Bot.uin ? "assistant" : "user",
                 messageId: msg.message_id,
-                content: `[${shortTimeOf(msg.time)}] ${msg.sender.nickname}(${msg.sender.user_id})${roleTagOf(msg.sender)}${msg.message_id ? `[ID:${msg.message_id}]` : ''}: ${msg.content}`
+                content: `[${shortTimeOf(msg.time)}] ${msg.sender.nickname || msg.sender.card || '未知'}${msg.message_id ? `[ID:${msg.message_id}]` : ''}: ${msg.content}`
               }))
             )
             groupUserMessages = await Promise.all(groupUserMessages.map(async msg => {
@@ -771,8 +775,16 @@ export class ChatPlugin extends plugin {
         }
 
         if (!session.cacheTurn) {
+          // V1：成员表直接拼 system 尾部（V1 无冻结头约束）。groupHistory 关闭时 chatHistory
+          // 不在作用域内，现场拉一份最近记录用于提取成员
+          let v1Source = null
+          try { v1Source = await this.messageManager.getMessages('group', groupId) } catch { v1Source = null }
+          const v1Participants = formatParticipants(extractParticipants(v1Source, botIdForEvent(e), Bot.nickname))
           groupUserMessages = groupUserMessages.filter(m => m.role !== "system")
-          groupUserMessages.unshift({ role: "system", content: systemContent })
+          groupUserMessages.unshift({ role: "system", content: systemContent + (v1Participants ? `
+【今日在场成员】
+发言人身份与QQ号（按昵称查询）：
+${v1Participants}` : '') })
           groupUserMessages.push({ role: "user", content: userContent })
           groupUserMessages = this.trimMessageHistory(groupUserMessages)
           groupUserMessages = this.filterChatByQQ(groupUserMessages, e.user_id)
@@ -888,7 +900,7 @@ export class ChatPlugin extends plugin {
         // 添加用户消息
         const senderRole = roleMap[e.sender?.role] || "member"
         const senderName = e.sender?.card || e.sender?.nickname || "未知用户"
-        const userMsg = `${this.formatTime()} ${senderName}(${e.user_id})${senderRole === 'admin' ? '[管理]' : senderRole === 'owner' ? '[群主]' : ''}: ${(session.userContent || e.msg || '').substring(0, 200)}`
+        const userMsg = `${this.formatTime()} ${senderName}: ${(session.userContent || e.msg || '').substring(0, 200)}`
         chatHistory.push({ role: 'user', content: userMsg })
 
         // 添加机器人回复

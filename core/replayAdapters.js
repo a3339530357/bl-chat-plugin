@@ -5,7 +5,9 @@ import { wireClone, tokenEstimate } from './promptCache.js'
 export const REPLAY_VERSION = 3
 // v2: 消息包装瘦身——历史行去掉日期/`qq号: `标签/`[群身份: member]`/`在群里说: `，
 // 每条省约 20 token（1290 条/天量级省 ~3 万）；旧格式存量由清洗正则兼容，新旧账本块可混排
-export const REPLAY_RENDERER_VERSION = 2
+// v3: 消息行只留 时间+昵称+ID（`[HH:MM] 昵称[ID:x]: 内容`）——QQ 号与群身份
+// 统一进尾部动态区【今日在场成员】表声明一次，不逐行重复；秒从时间戳中去除
+export const REPLAY_RENDERER_VERSION = 3
 
 export function agentAssistantRow(message) {
   if (message.role && message.role !== 'assistant') throw new ContextStoreError('invalid_agent_role')

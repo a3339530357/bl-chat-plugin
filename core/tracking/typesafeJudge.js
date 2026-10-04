@@ -75,12 +75,26 @@ export async function typesafeBatchJudge(config, batch) {
     text: item.userMessage
   }))
 
+  // 渲染 v3：发送者 QQ 号/身份抽离为 participants 表声明一次（消息行只留名字）
+  const participantMap = new Map()
+  for (const item of batch) {
+    const qq = String(item.e?.user_id ?? '')
+    if (!qq) continue
+    const sender = item.e?.sender || {}
+    participantMap.set(qq, {
+      qq, name: item.senderName || sender.nickname || '未知用户',
+      role: sender.role || (item.e?.sender?.role) || 'member'
+    })
+  }
+  const participants = [...participantMap.values()]
+  if (botUin) participants.push({ qq: String(botUin), name: botName, role: 'bot' })
+
   // 每条消息一个独立 Noul 问题：Jev 对同一 state 的独立问题并行作答、互不可见
   const questions = {}
   for (const m of messages) {
     questions[m.id] = {
       type: 'noul',
-      instructions: `messages 中 id 为 \`${m.id}\` 的这条消息，是在跟机器人${botName}${botUin ? `(QQ号${botUin})` : ''}说话吗？对机器人的回应、追问、催促、抱怨、责骂都算；@了其他群成员、明确叫别人名字、与机器人无关的群聊水群不算。`
+      instructions: `messages 中 id 为 \`${m.id}\` 的这条消息，是在跟机器人${botName}（见 participants）说话吗？对机器人的回应、追问、催促、抱怨、责骂都算；@了其他群成员、明确叫别人名字、与机器人无关的群聊水群不算。`
     }
   }
 
@@ -172,7 +186,17 @@ export async function typesafeGateJudge(config, payload) {
     currentMessage.structure = messageStructure(currentMessage.message)
     delete currentMessage.message
   }
-  const state = { ...payload, currentMessage, history: history.rows,
+  // 渲染 v3：发言人的 QQ 号/身份从历史行抽离，participants 表声明一次，行内只留 name 短引用
+  const participantMap = new Map()
+  for (const row of history.rows) {
+    if (!row.sender?.qq) continue
+    participantMap.set(row.sender.qq, { qq: row.sender.qq, name: row.sender.name, role: row.sender.role, identity: row.sender.identity })
+  }
+  const participants = [...participantMap.values()]
+  for (const row of history.rows) {
+    row.sender = { name: row.sender.name, ref: row.sender.qq }
+  }
+  const state = { ...payload, currentMessage, participants, history: history.rows,
     historyOrder: 'newest_first', historyTrim: { originalCount: history.originalCount, dropped: history.dropped, truncated: history.truncated },
     timing: { ...payload.timing, isLateNight } }
   const question = {

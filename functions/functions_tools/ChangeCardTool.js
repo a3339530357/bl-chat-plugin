@@ -5,7 +5,7 @@ export class ChangeCardTool extends AbstractTool {
   constructor() {
     super();
     this.name = 'changeCardTool';
-    this.description = '这是一个实现修改名称(名字)功能的工具，当你想改自己的名称(名字)或者想改其他人的名称(名字)时，调用此工具。';
+    this.description = '这是一个实现修改名称(名字)功能的工具，当你想改自己的名称(名字)或者想改其他人的名称(名字)时，调用此工具。目标QQ号可从【今日在场成员】表按昵称查询。';
     this.parameters = {
       type: "object",
       properties: {

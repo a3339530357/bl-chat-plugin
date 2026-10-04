@@ -8,7 +8,7 @@ export class MemberInfoTool extends AbstractTool {
   constructor() {
     super();
     this.name = 'memberInfoTool';
-    this.description = '查询群成员的详细信息，包括昵称、群名片、入群时间、最后发言时间、等级、头衔、角色等';
+    this.description = '查询群成员的详细信息，包括昵称、群名片、入群时间、最后发言时间、等级、头衔、角色等。目标QQ号可从【今日在场成员】表按昵称查询。';
     this.parameters = {
       type: 'object',
       properties: {

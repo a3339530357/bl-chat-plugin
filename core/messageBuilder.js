@@ -6,17 +6,19 @@ import { sanitizeFinalReplyText } from "./pseudoToolSanitizer.js"
 
 export const roleMap = { owner: "owner", admin: "admin", member: "member" }
 
-// 时间统一取 HH:MM:SS（账本按天分 key，同批消息日期冗余）
+// 时间统一取 HH:MM（账本按天分 key，日期冗余；秒对模型无增量价值）
 export function shortTimeOf(time) {
   const text = String(time ?? '')
-  const full = /\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2}:\d{2})/.exec(text)
+  const full = /\d{4}-\d{2}-\d{2}\s+(\d{2}:\d{2}):\d{2}/.exec(text)
   if (full) return full[1]
-  if (/^\d{2}:\d{2}:\d{2}$/.test(text)) return text
+  const hm = /^(\d{2}:\d{2}):\d{2}$/.exec(text)
+  if (hm) return hm[1]
+  if (/^\d{2}:\d{2}$/.test(text)) return text
   const seconds = Number(text)
   if (Number.isFinite(seconds) && seconds > 1e9) {
     const d = new Date(seconds * 1000)
     const pad = n => String(n).padStart(2, "0")
-    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}`
   }
   return text
 }
@@ -27,16 +29,38 @@ export function roleTagOf(sender) {
   return role === 'admin' ? '[管理]' : role === 'owner' ? '[群主]' : ''
 }
 
+// 从消息记录提取在场成员表（QQ→最新昵称+身份，去重；bot 单独列末位）。
+// 身份是低频事实：尾部动态区声明一次，历史行只留短名字引用（渲染 v3）
+export function extractParticipants(rows, botId, botName) {
+  const map = new Map()
+  for (const msg of (rows || [])) {
+    const sender = msg?.sender || msg?.message?.sender || {}
+    if (!sender.user_id || String(sender.user_id) === String(botId)) continue
+    const name = sender.card || sender.nickname
+    if (!name) continue
+    map.set(String(sender.user_id), { qq: String(sender.user_id), name: String(name), role: roleTagOf(sender) || '[member]' })
+  }
+  const list = [...map.values()]
+  if (botId != null && botId !== '') {
+    list.push({ qq: String(botId), name: botName || '哈基米', role: '[bot]' })
+  }
+  return list
+}
+
+export function formatParticipants(list) {
+  return (list || []).map(p => `${p.name} = QQ ${p.qq} ${p.role}`).join('\n')
+}
+
 export function formatReplayEventRow(event, botId) {
   const message = event.message || event
   const sender = message.sender || {}
   if (String(message.content || '').startsWith('【系统提示】')) return null
   const role = String(sender.user_id) === String(botId) ? 'assistant' : 'user'
-  // 渲染 v2 包装：`[HH:MM:SS] 昵称(QQ号)[ID:x]: 内容`；bot 行留 `[昵称][ID:x]: 内容`
-  // （bot 的 ID 必须保留——「撤回你刚才那句」类请求靠它定位目标消息）
+  // 渲染 v3 包装：`[HH:MM] 昵称[ID:x]: 内容`——QQ 号与群身份统一进尾部【今日在场成员】表，
+  // 不逐行重复；bot 行 `[昵称][ID:x]: 内容`（ID 保留——「撤回你刚才那句」靠它定位）
   let content = role === 'assistant'
     ? `[${sender.nickname || 'Bot'}]${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
-    : `[${shortTimeOf(message.time)}] ${sender.nickname}(${sender.user_id})${roleTagOf(sender)}${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
+    : `[${shortTimeOf(message.time)}] ${sender.nickname || sender.card || '未知'}${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`
   if (role === 'assistant' && content.length > 200) content = `${content.substring(0, 200)}...`
   return { role, content }
 }
@@ -132,12 +156,12 @@ export const messageBuilderMethods = {
   formatTime() {
     const now = new Date()
     const pad = n => String(n).padStart(2, "0")
-    return `[${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}]`
+    return `[${pad(now.getHours())}:${pad(now.getMinutes())}]`
   }
 ,
   async buildMessageContent(sender, msg, images, atQq = [], group, e = null) {
     const messageId = e?.message_id ? `[ID:${e.message_id}]` : ''
-    const senderInfo = `${sender.card || sender.nickname}(${sender.user_id})${roleTagOf(sender)}${messageId}`
+    const senderInfo = `${sender.card || sender.nickname}${messageId}`
 
     let atContent = ""
     if (atQq.length > 0 && group) {
@@ -398,8 +422,10 @@ export const messageBuilderMethods = {
     // 旧: "[2026-01-27 16:12:51] 哈基米(QQ号: 2127498644)[群身份: member]: 在群里说: xxx"
     // 新: "[16:11:11] 哈基米(1694409974)[管理][ID:xxx]: xxx" / "[哈基米][ID:x]: xxx"
     const tagClass = '(?:群身份[:：][ \\t]*\\w+|管理|群主|(?:消息)?ID:[^\\]\n]*)'
-    const timeClass = '[A-Z]{4}-[A-Z]{2}-[A-Z]{2} [A-Z]{2}:[A-Z]{2}:[A-Z]{2}|[A-Z]{2}-[A-Z]{2} [A-Z]{2}:[A-Z]{2}:[A-Z]{2}|\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}|\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}|\\d{2}:\\d{2}:\\d{2}'
+    const timeClass = '[A-Z]{4}-[A-Z]{2}-[A-Z]{2} [A-Z]{2}:[A-Z]{2}:[A-Z]{2}|[A-Z]{2}-[A-Z]{2} [A-Z]{2}:[A-Z]{2}:[A-Z]{2}|\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}|\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}|\\d{2}:\\d{2}:\\d{2}|\\d{2}:\\d{2}'
     const named = `[^(\n]+\\((?:(?:QQ号|qq号)[:：][ \\t]*)?\\d+\\)`
+    // 渲染 v3：消息行无 QQ 括号，名字后直接跟 [ID:x]/[管理] 标签——标签本身即记录行证据
+    const namedV3 = `[^(\n\\[]+(?:\\[${tagClass}\\])+`
 
     // 第 1 步 bot 行前缀剥离（必须最先：趁 markdown 转换未拆坏特殊昵称，且剥掉外层后
     // 内层记录行还能被后续 R1/R2 清洗——修 V1 双层包装逃逸）
@@ -410,9 +436,9 @@ export const messageBuilderMethods = {
 
     // 第 2 步 R1a 强证据整行删：带身份/ID 标签（行首锚定，所有空白单行化不跨行吞答；
     // 裸日志行"[17:46:37] worker(123): ENOENT"无标签，不受此条影响）
-    output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*${named}(?:\\[${tagClass}\\])+[ \\t]*[:：][ \\t]*(?:艾特了[ \\t]*${named}(?:\\[${tagClass}\\])*)?[ \\t]*(?:在群里说[:：][ \\t]*)?[^\\n]*`, 'gi'), '\n')
+    output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*(?:${named}(?:\\[${tagClass}\\])+|${namedV3})[ \\t]*[:：][ \\t]*(?:艾特了[ \\t]*${named}(?:\\[${tagClass}\\])*)?[ \\t]*(?:在群里说[:：][ \\t]*)?[^\\n]*`, 'gi'), '\n')
     // 第 3 步 R1b：无标签但带「在群里说」引导语的旧格式行同样整行删
-    output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*${named}[ \\t]*[:：][ \\t]*在群里说[:：][ \\t]*[^\\n]*`, 'gi'), '\n')
+    output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*(?:${named}|${namedV3})[ \\t]*[:：][ \\t]*在群里说[:：][ \\t]*[^\\n]*`, 'gi'), '\n')
     // 第 4 步 R2 温和剥前缀：裸形状（时间 名(号): ）只删前缀留正文——与日志撞车时内容不丢
     output = output.replace(new RegExp(`(?:^|\\n)\\[(?:${timeClass})\\][ \\t]*${named}[ \\t]*[:：][ \\t]*`, 'g'), '\n')
 

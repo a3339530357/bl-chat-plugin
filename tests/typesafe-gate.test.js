@@ -113,7 +113,9 @@ test('Gate truncates a giant multiline record body while preserving sender, ment
   const state = calls[0].state
   const row = state.history[0]
   assert.equal(state.history.length, 1)
-  assert.equal(row.sender.role, 'owner')
+  // 渲染 v3：QQ/身份抽到 participants 表，行内 sender 只留 name+ref
+  assert.equal(row.sender.ref, '200')
+  assert.ok(state.participants.some(p => p.qq === '200' && p.role === 'owner'))
   assert.equal(row.messageId, 'large')
   assert.equal(row.truncated, true)
   assert.equal(row.originalContentChars, input.history[0].content.length)

@@ -5,7 +5,7 @@ export class SendGiftTool extends AbstractTool {
     super()
 
     this.name = "sendGiftTool"
-    this.description = "发送QQ礼物给指定用户，支持多种礼物类型（如香槟、风暴战锤、遨游太空、蹦迪派对、露营、龙腾万里、超级跑车、直升机等）"
+    this.description = "发送QQ礼物给指定用户，支持多种礼物类型（如香槟、风暴战锤、遨游太空、蹦迪派对、露营、龙腾万里、超级跑车、直升机等）。目标QQ号可从【今日在场成员】表按昵称查询。"
 
     this.parameters = {
       type: "object",

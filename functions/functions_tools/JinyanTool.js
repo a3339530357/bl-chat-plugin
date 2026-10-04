@@ -7,7 +7,7 @@ export class JinyanTool extends AbstractTool {
   constructor() {
     super();
     this.name = 'jinyanTool';
-    this.description = '对群聊中的用户进行禁言/解禁操作，如果想要对群员进行禁言请调用此工具，但也请不要随意的就调用该工具禁言，除非真的违规了或者涉证讨论国家敏感问题或者骂的特别难听时调用';
+    this.description = '对群聊中的用户进行禁言/解禁操作，如果想要对群员进行禁言请调用此工具，但也请不要随意的就调用该工具禁言，除非真的违规了或者涉证讨论国家敏感问题或者骂的特别难听时调用。目标QQ号可从【今日在场成员】表按昵称查询。';
     this.parameters = {
       type: "object",
       properties: {
