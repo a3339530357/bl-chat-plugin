@@ -28,13 +28,17 @@ export async function typesafeRequest(config, body) {
       })
       if (!response.ok) {
         const text = await response.text().catch(() => '')
-        throw new Error(`HTTP ${response.status}: ${text.slice(0, 120)}`)
+        const status = response.status
+        const err = new Error(`HTTP ${status}: ${text.slice(0, 120)}`)
+        err.httpStatus = status // 重试判据用状态码，勿从消息文本识别（正文可能恰好含 "HTTP 500" 字样）
+        throw err
       }
       return await response.json()
     } catch (error) {
       lastError = error
       // 仅重试网络类故障（超时/连接重置/5xx）；4xx 是请求形状问题，重试无意义
-      const retriable = error.name === 'AbortError' || error.name === 'TypeError' || /HTTP 5\d\d/.test(error.message || '')
+      const retriable = error.name === 'AbortError' || error.name === 'TypeError'
+        || (typeof error.httpStatus === 'number' && error.httpStatus >= 500)
       if (!retriable || attempt === TYPESAFE_MAX_ATTEMPTS) throw error
     } finally {
       clearTimeout(timer)
@@ -79,7 +83,10 @@ export async function typesafeBatchJudge(config, batch) {
   const threshold = Number(config.typesafeThreshold) || 0.5
   const probabilities = {}
   for (const [id, answer] of Object.entries(result.answers || {})) {
-    if (answer && typeof answer.noul === 'number') probabilities[id] = answer.noul
+    // 只接受有限且在 [0,1] 内的概率：JSON 1e400 会解析成 Infinity、异常响应可能越界，
+    // 无效值按缺项处理交由上层整批回退 flash，不直接采信
+    const p = answer?.noul
+    if (Number.isFinite(p) && p >= 0 && p <= 1) probabilities[id] = p
   }
   return { probabilities, threshold, model: result.model }
 }

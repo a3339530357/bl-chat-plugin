@@ -49,10 +49,19 @@ test('typesafeRequest：网络故障重试一次后成功', async () => {
   assert.equal(calls.length, 2)
 })
 
-test('typesafeRequest：4xx 不重试直接抛', async () => {
-  const calls = mockFetch([{ status: 400, json: { detail: 'bad' } }])
+test('typesafeRequest：4xx 不重试直接抛（正文含 "HTTP 500" 字样也不误判）', async () => {
+  const calls = mockFetch([{ status: 400, json: { detail: 'invalid input: HTTP 500 is an example value' } }])
   await assert.rejects(() => typesafeRequest(config, {}), /HTTP 400/)
   assert.equal(calls.length, 1)
+})
+
+test('typesafeBatchJudge：Infinity/越界概率按缺项处理（上层整批回退）', async () => {
+  mockFetch([{ json: { answers: {
+    'MSG_1_g_100': { type: 'noul', noul: 2.5 },        // 越界
+    'MSG_2_g_200': { type: 'noul', noul: Infinity } } } }]) // JSON 1e400 解析为 Infinity
+  const { probabilities } = await typesafeBatchJudge(config, batch)
+  // 两条都无效 → probabilities 为空 → 上层 every() 为 false 整批回退 flash
+  assert.equal(Object.keys(probabilities).length, 0)
 })
 
 test('typesafeRequest：连续网络失败重试耗尽后抛（供上层回退 flash）', async () => {

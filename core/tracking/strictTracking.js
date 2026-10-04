@@ -193,7 +193,7 @@ export const strictTrackingMethods = {
         }))
         const { probabilities, threshold } = await typesafeBatchJudge(this.config.trackAiConfig, batchWithIds)
         logger.info(`[批量判断][typesafe] ${batch.length}条，概率: ${JSON.stringify(probabilities)} (阈值${threshold})`)
-        // 全部命中且无缺失 → 直接按概率出结果；有缺失的条目连同整体回退 flash（保持与原缺项逻辑一致）
+        // 全部命中 → 按概率出结果；任一缺失/无效值（含越界概率）→ 整批回退 flash，避免同批混用两种判定口径
         if (batchWithIds.every(item => typeof probabilities[item.id] === 'number')) {
           batchWithIds.forEach(item => item.resolve(probabilities[item.id] >= threshold))
           return
