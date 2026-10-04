@@ -17,6 +17,10 @@ export async function typesafeRequest(config, body) {
   const apiKey = config.typesafeApiKey
   if (!apiKey || apiKey.includes('xxxxx')) throw new Error('typesafeApiKey 未配置')
 
+  // 判定原样落盘（观察用）：typesafeDump 开启时写最近一次请求/响应到 /root/tmp/
+  if (config.typesafeDump) {
+    try { (await import('fs')).default.writeFileSync('/root/tmp/jev-last-request.json', JSON.stringify(body, null, 2)) } catch {}
+  }
   let lastError = null
   for (let attempt = 1; attempt <= TYPESAFE_MAX_ATTEMPTS; attempt++) {
     const controller = new AbortController()
@@ -35,7 +39,11 @@ export async function typesafeRequest(config, body) {
         err.httpStatus = status // 重试判据用状态码，勿从消息文本识别（正文可能恰好含 "HTTP 500" 字样）
         throw err
       }
-      return await response.json()
+      const json = await response.json()
+      if (config.typesafeDump) {
+        try { (await import('fs')).default.writeFileSync('/root/tmp/jev-last-response.json', JSON.stringify(json, null, 2)) } catch {}
+      }
+      return json
     } catch (error) {
       lastError = error
       // 仅重试网络类故障（超时/连接重置/5xx）；4xx 是请求形状问题，重试无意义

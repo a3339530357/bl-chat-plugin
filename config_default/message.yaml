@@ -201,6 +201,7 @@ pluginSettings:
     typesafeModel: jev-latest,
     typesafeApiKey: "",
     typesafeThreshold: 0.5,
+    typesafeDump: false,
     typesafeGateThreshold: 0.5
   }
   toolsAiConfig: {
