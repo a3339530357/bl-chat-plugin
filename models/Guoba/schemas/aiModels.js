@@ -49,6 +49,12 @@ export default [
       ]
     }
   },
+  {
+    component: "Switch",
+    label: "判定过程落盘",
+    field: "trackAiConfig.typesafeDump",
+    bottomHelpMessage: "每次 Jev 判定把原始请求和响应原样写到 /root/tmp/jev-last-request.json 和 jev-last-response.json（覆盖式，看最近一次）。排查判断问题用，平时可关"
+  },
   ...makeAiBlock(
     "工具决策模型（判断要不要用工具）",
     "toolsAiConfig",
