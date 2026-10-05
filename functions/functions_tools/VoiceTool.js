@@ -48,9 +48,13 @@ export class VoiceTool extends AbstractTool {
       }
       const buffer = Buffer.from(await response.arrayBuffer())
       const { randomUUID } = await import('crypto')
-      const tmpFile = `/root/tmp/voice-${randomUUID().slice(0, 8)}.mp3`
+      // 临时文件放 TRSS data/ 下：该目录已只读挂载进 NapCat 容器，
+      // /root/tmp 未挂载会让 NapCat 读 file:// 时 ENOENT（同视频发送问题）
+      const tmpFile = `/root/projects/TRSS-Yunzai/data/voice-${randomUUID().slice(0, 8)}.mp3`
       fs.writeFileSync(tmpFile, buffer)
       await e.reply(segment.record(`file://${tmpFile}`))
+      // NapCat 处理完再清理，避免 data/ 堆积语音文件
+      setTimeout(() => { try { fs.unlinkSync(tmpFile) } catch { } }, 60000)
       return `发送语音内容(${text})成功，你已经发送语音了，所以不需要强调你已经发送语音，继续说之后的事情，回复的文字内容不要和语音内容重合`
     } catch (error) {
       return `发送语音失败: ${error.message}`
