@@ -388,7 +388,7 @@ test("smart：首轮仍在处理中时，同一 message_id 不会被排成第二
   assert.equal(bot.__calls.handleTool.length, 1)
 })
 
-test("smart：前一轮回复已读取到排队的 @ 消息时取消第二轮", async () => {
+test("smart：前一轮回复已读取到排队的 @ 消息时仍必回第二轮（@指令躺上下文≠已执行）", async () => {
   const bot = makeBot({ config: { smartTrigger: { talkValue: 1 } } })
   bot.gateResult = { decision: "continue" }
   let enteredHandleTool
@@ -418,9 +418,12 @@ test("smart：前一轮回复已读取到排队的 @ 消息时取消第二轮", 
   await new Promise(resolve => setImmediate(resolve))
 
   const state = bot.getSmartState(groupId)
-  assert.equal(bot.__calls.handleTool.length, 1)
   assert.equal(state.needsRerun, false)
-  assert.equal(state.forceContinue, false)
+  // @ 指令让位后豁免合并取消：躺进上一轮上下文不等于已被执行，必须重跑必回
+  for (let i = 0; i < 50 && bot.__calls.handleTool.length < 2; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.equal(bot.__calls.handleTool.length, 2)
 })
 
 test("smart：@ 消息在前一轮历史快照之后到达时仍保留必回第二轮", async () => {
