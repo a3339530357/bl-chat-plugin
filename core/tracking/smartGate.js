@@ -204,6 +204,7 @@ export const smartGateMethods = {
         rerunContextVersion: 0,
         queuedWhileInFlight: 0,
         queuedForceGateCheck: false,
+        queuedForceTrigger: false,
         waitTimers: new Map(),
         waitTaskVersions: new Map(),
         groupContextVersion: 0,
@@ -302,6 +303,9 @@ export const smartGateMethods = {
       if ((hasQueuedTrigger && smartCfg.inevitableAtReply !== false) || hasQueuedNameMention || e?._proactiveReply) {
         state.forceContinue = true
         state.rerunEvent = e
+        // @/前缀是明确指令而非旁观内容：躺进当前轮上下文 ≠ 已被执行，
+        // 合并取消（_conversationProducedOutput 分支）对此不适用，必须重跑
+        state.queuedForceTrigger = true
       } else if (!state.forceContinue) {
         state.rerunEvent = e
       }
@@ -531,7 +535,7 @@ export const smartGateMethods = {
         // @/新消息在前一轮读取群历史前到达时，前一轮的模型上下文已经包含这些消息。
         // 若前一轮也确实产出了回复，就不能再把同一批上下文排成第二轮；
         // 若消息在历史快照之后才到达，则版本更大，仍保留重跑以保证 @ 必回。
-        if (e?._conversationProducedOutput === true && rerunContextVersion > 0 &&
+        if (!state.queuedForceTrigger && e?._conversationProducedOutput === true && rerunContextVersion > 0 &&
             handledContextVersion >= rerunContextVersion) {
           logger.info(`[Smart合并] group=${groupId} 当前回复已覆盖排队消息 context=${handledContextVersion}/${rerunContextVersion}，取消重复重跑`)
           state.needsRerun = false
@@ -548,6 +552,7 @@ export const smartGateMethods = {
           state.rerunEvent = null
           state.rerunContextVersion = 0
           state.queuedForceGateCheck = false
+          state.queuedForceTrigger = false
           const wrappedRerun = Object.create(rerunEvent)
           wrappedRerun._smartQueuedRerun = true
           if (queuedForceGateCheck) wrappedRerun._smartQueuedGateCheck = true
