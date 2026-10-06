@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { ContextStore, validateToolRows } from '../core/contextStore.js'
 import { promptCacheSettings, beijingDay, isPromptCacheEnabled, originKeyForEvent, tokenEstimate } from '../core/promptCache.js'
-import { buildPromptCacheHeaders, buildTurnReferenceContent, TURN_REFERENCE_START, TURN_REFERENCE_END } from '../core/prompts.js'
+import { buildPromptCacheHeaders } from '../core/prompts.js'
+import { legacyReferenceContent } from './helpers/legacy-reference.js'
 import { sessionHistoryMethods } from '../core/sessionHistory.js'
 import { redisFixture } from './helpers/redis-fixture.js'
 
@@ -181,11 +182,10 @@ test('overflowing new content does not destroy an existing replay prefix', async
 test('legacy references migrate before budget trimming without losing tool rows, replies, IDs or cursor', async () => {
   const { store, scope } = await storeScope()
   await store.record(scope, event('old'))
-  const reference = buildTurnReferenceContent({
+  const legacy = legacyReferenceContent({
     turnId: 'old', userId: 'user', messageId: 'old', asOf: '2026-10-03T12:00:00.000Z',
     references: { memory: 'obsolete memory '.repeat(4000) }, taskStatuses: [], allowedTools: ['probe']
   })
-  const legacy = '\n\n' + reference.slice(TURN_REFERENCE_START.length, -TURN_REFERENCE_END.length)
   const user = { role: 'user', content: 'full original user body\nimage URL' + legacy }
   const call = { role: 'assistant', tool_calls: [{ id: 'original-call', type: 'function', function: { name: 'probe', arguments: ' { "x" : 1 } ' } }] }
   const result = { role: 'tool', tool_call_id: 'original-call', content: 'exact result bytes' }
@@ -215,8 +215,8 @@ test('legacy references migrate before budget trimming without losing tool rows,
 test('legacy writes after cleanup are detected and migrated on the next read', async () => {
   const { store, scope } = await storeScope()
   const makeLegacy = id => {
-    const reference = buildTurnReferenceContent({ turnId: id, userId: 'user', messageId: id, asOf: '2026-10-03T12:00:00.000Z', references: {}, taskStatuses: [], allowedTools: [] })
-    const row = { role: 'user', content: id + '\n\n' + reference.slice(TURN_REFERENCE_START.length, -TURN_REFERENCE_END.length) }
+    const reference = legacyReferenceContent({ turnId: id, userId: 'user', messageId: id, asOf: '2026-10-03T12:00:00.000Z', allowedTools: [] })
+    const row = { role: 'user', content: id + reference }
     return { ...block(id), toolRows: [row], chatRows: [row] }
   }
   for (const id of ['old-one', 'old-two']) {

@@ -2,6 +2,8 @@
 // 内存 Map + redis 双层缓存。
 // 以 mixin 形式挂到插件原型上，this 指向插件实例（依赖 this.TASK_STATUS_PREFIX、this.config）。
 
+import { replayToolResults, taskOutcomeCovered } from './replayCoverage.js'
+
 const taskStatusCache = new Map()
 // 内存缓存按"消息"记键，必须设上限：tool_success/tool_failed 的记录不会被 clearTaskStatus
 // 清理（redis 侧靠 TTL 过期），无上限会随消息量无限增长。超限时按插入序淘汰最旧的，
@@ -20,6 +22,27 @@ function setTaskStatusCache(key, record) {
 }
 
 export const taskStatusMethods = {
+  async getTaskStatusFacts(groupId, messageIds, currentMessageId, snapshot) {
+    const results = replayToolResults(snapshot.blocks)
+    const ids = [...new Set(messageIds.filter(id => id != null && String(id) !== String(currentMessageId)).map(String))]
+    const facts = await Promise.all(ids.map(async id => {
+      const status = await this.getTaskStatus(groupId, id)
+      const key = `task:${id}`
+      const previous = snapshot.noteState?.[key]
+      const previousValue = previous ? JSON.parse(previous.valueJson) : null
+      if (!status || taskOutcomeCovered(status, results)) {
+        // Clear a formerly active annotation once; the native receipt already
+        // carries the outcome, so do not inject its success/failure again.
+        return previousValue ? { key, value: null, text: `任务 消息${id}=closed` } : null
+      }
+      const state = { processing: 'processing', tool_running: 'running', tool_success: 'success', tool_failed: 'failed' }[status.status]
+      if (!state) return null
+      const value = { tool: status.toolName || '', state, ...(status.error ? { error: status.error } : {}) }
+      return { key, value, text: `任务 消息${id} ${value.tool || '-'}=${state}${value.error ? ` 原因=${JSON.stringify(value.error)}` : ''}` }
+    }))
+    return facts.filter(Boolean)
+  },
+
   async getTaskStatusPromptSnapshot(groupId, messageIds, currentMessageId) {
     const ids = [...new Set(messageIds.filter(id => id !== undefined && id !== null && String(id) !== String(currentMessageId)).map(String))]
     const states = await Promise.all(ids.map(async id => {
@@ -42,7 +65,7 @@ export const taskStatusMethods = {
     return Math.max(60, Math.floor((this.config.groupChatMemoryDays || 1) * 24 * 60 * 60))
   }
 ,
-  async saveTaskStatus({ groupId, userId, messageId, status, toolName = "", error = "" }) {
+  async saveTaskStatus({ groupId, userId, messageId, status, toolName = "", error = "", toolCallId }) {
     if (!groupId || !messageId || !status) return
 
     const record = {
@@ -52,6 +75,7 @@ export const taskStatusMethods = {
       status,
       toolName,
       error: error ? String(error).slice(0, 120) : "",
+      ...(toolCallId ? { toolCallId } : {}),
       updatedAt: Date.now()
     }
     const cacheKey = this.getTaskStatusCacheKey(groupId, messageId)
@@ -64,6 +88,7 @@ export const taskStatusMethods = {
     } catch (error) {
       logger.warn(`[任务状态] 写入失败：${error.message}`)
     }
+    return record
   }
 ,
   async getTaskStatus(groupId, messageId) {

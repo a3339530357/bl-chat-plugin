@@ -10,13 +10,17 @@ import { originKeyForEvent, promptCacheSettings, replayEventRow, tokenEstimate, 
 import { buildTurnReferenceContent } from './prompts.js'
 import { taskStatusMethods } from './taskStatus.js'
 import { replayRows } from './replayAdapters.js'
+import { participantFacts, planContextNotes, referenceFacts, profileFacts } from './contextNotes.js'
+import { toolHistoryFacts } from './toolHistory.js'
+import { dumpTurnTail } from './tailDump.js'
 
 const _path = process.cwd()
 
 export const sessionHistoryMethods = {
-  async preparePromptCacheTurn({ e, session, scope, header, userContent, references, manager, allowedTools, agentControls, config = this.config }) {
+  async preparePromptCacheTurn({ e, session, scope, header, userContent, references, participants = [], profileMessages = [], manager, allowedTools, agentControls, config = this.config, extraIncomingTokens = 0, prepareAttempt = 0 }) {
     const store = this.contextStore || contextStore
     const settings = promptCacheSettings(config)
+    const sourceReferences = references
     await manager.recordMessage(e, {
       journalOnly: true, messageMaxLength: 200, promptCacheConfig: config,
       contextStore: store, scope, journalContent: userContent
@@ -25,18 +29,19 @@ export const sessionHistoryMethods = {
     const asOf = new Date().toISOString()
     const preliminary = buildTurnReferenceContent({
       turnId: session.turnId, userId: e.user_id, messageId: e.message_id, asOf,
-      references, taskStatuses: [], allowedTools, agentControls
+      references: { time: references['北京时间'] || references.time }, taskStatuses: [], allowedTools, agentControls, declaredTools: header.tools
     })
     const agent = header.mode === 'agent'
     const incomingTokens = (agent ? tokenEstimate(header.agentSystem) + tokenEstimate(header.tools) :
       Math.max(tokenEstimate(header.toolSystem) + tokenEstimate(header.tools), tokenEstimate(header.chatSystem))) +
-      tokenEstimate(userContent + preliminary)
+      tokenEstimate(userContent + preliminary) + extraIncomingTokens
     const snapshot = await store.read(scope, header, settings, incomingTokens, origin)
     if (snapshot.headerChanged) cacheDiagnostic(config, 'header_change', { groupId: scope.groupId })
     if (snapshot.modeChanged) cacheDiagnostic(config, 'mode_switch', { groupId: scope.groupId, mode: agent ? 'agent' : 'dual' })
     if (snapshot.projectionChanged) cacheDiagnostic(config, 'projection_change', { groupId: scope.groupId })
     if (snapshot.firstModeUse && agent) cacheDiagnostic(config, 'agent_first_use', { groupId: scope.groupId })
     if (snapshot.dropped) cacheDiagnostic(config, 'capacity_trim', { groupId: scope.groupId, blocks: snapshot.dropped })
+    if (snapshot.notesCompacted) cacheDiagnostic(config, 'note_compression', { groupId: scope.groupId })
     const observers = []
     const represented = [origin]
     const observerBlock = (row, messageIds) => ({
@@ -58,7 +63,16 @@ export const sessionHistoryMethods = {
       ...snapshot.blocks.flatMap(block => block.messageIds || []),
       ...snapshot.events.map(event => event.message?.message_id)
     ].filter(id => id !== undefined && id !== null && String(id) !== String(e.message_id)).map(String))]
-    const taskStatuses = await taskStatusMethods.getTaskStatusPromptSnapshot.call(this, scope.groupId, messageIds, e.message_id)
+    const taskFacts = await taskStatusMethods.getTaskStatusFacts.call(this, scope.groupId, messageIds, e.message_id, snapshot)
+    const history = this.isToolHistoryEnabled?.() !== false && this.loadToolHistory ? await this.loadToolHistory(scope.groupId) : []
+    const historyFacts = toolHistoryFacts(history, snapshot, settings.toolHistoryTokens)
+    const taskKeys = new Set(messageIds.map(id => `task:${id}`))
+    const retiredTasks = Object.keys(snapshot.noteState).filter(key => key.startsWith('task:') && !taskKeys.has(key))
+      .map(key => ({ key, value: null, text: '', retired: true }))
+    const notePlan = planContextNotes(snapshot, [...participantFacts(snapshot, participants, e), ...taskFacts, ...historyFacts, ...retiredTasks,
+      ...referenceFacts(snapshot, references, e.user_id), ...profileFacts(snapshot, profileMessages, e.user_id, e.message_id, userContent, observers)])
+    references = { time: references['北京时间'] || references.time, updates: notePlan.content }
+    const taskStatuses = []
     const selected = this.filterChatByQQ([
       ...observers.flatMap(observer => replayRows(observer.block, agent ? 'agent' : 'tools')), { role: 'user', content: userContent }
     ], e.user_id)
@@ -70,18 +84,25 @@ export const sessionHistoryMethods = {
     }
     const referenceContent = buildTurnReferenceContent({
       turnId: session.turnId, userId: e.user_id, messageId: e.message_id, asOf,
-      references, taskStatuses, allowedTools, newObserverCount, agentControls
+      references, taskStatuses, allowedTools, newObserverCount, agentControls, declaredTools: snapshot.header.tools
     })
     const turn = new CacheTurn({
       turnId: session.turnId, scope, snapshot, observers, represented, settings, messageId: e.message_id,
-      userRow: { role: 'user', content: userContent + referenceContent }, referenceContent, agentControls
+      userRow: { role: 'user', content: userContent + referenceContent }, referenceContent, agentControls, notes: notePlan.notes
     })
     const requestTokens = agent ? tokenEstimate(turn.agentBase) + tokenEstimate(snapshot.header.tools) :
       Math.max(tokenEstimate(turn.toolBase) + tokenEstimate(snapshot.header.tools), tokenEstimate(turn.chatBase))
     if (requestTokens + settings.reserveTokens > settings.highWater) {
+      const required = Math.max(tokenEstimate(referenceContent) - tokenEstimate(preliminary),
+        extraIncomingTokens + requestTokens + settings.reserveTokens - settings.highWater + 64)
+      if (prepareAttempt < 2) return this.preparePromptCacheTurn({
+        e, session, scope, header, userContent, references: sourceReferences, participants, profileMessages, manager,
+        allowedTools, agentControls, config, extraIncomingTokens: required, prepareAttempt: prepareAttempt + 1
+      })
       throw new ContextStoreError('incoming_overflow')
     }
     if (agent) turn.baseTokens = requestTokens
+    await dumpTurnTail(config, turn, referenceContent)
     return turn
   },
 
@@ -93,7 +114,7 @@ export const sessionHistoryMethods = {
     const store = this.contextStore || contextStore
     const payload = {
       turnId: turn.turnId, readUntil: turn.snapshot.readUntil, baseCursor: turn.snapshot.cursor,
-      observers: turn.observers, represented, block: turn.block()
+      observers: turn.observers, represented, block: turn.block(), notes: turn.notes
     }
     for (let attempt = 0; attempt < 2; attempt++) {
       try {

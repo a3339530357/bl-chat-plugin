@@ -18,7 +18,7 @@ export function bindCacheRequest(request, turn) {
 export function cacheRequestContext(request) { return requestContexts.get(request) }
 
 export class CacheTurn {
-  constructor({ turnId, scope, snapshot, observers, userRow, referenceContent, represented, settings, messageId, agentControls }) {
+  constructor({ turnId, scope, snapshot, observers, userRow, referenceContent, represented, settings, messageId, agentControls, notes = [] }) {
     this.turnId = turnId
     this.scope = scope
     this.snapshot = snapshot
@@ -28,6 +28,7 @@ export class CacheTurn {
     this.messageId = messageId
     this.observers = observers
     this.represented = represented
+    this.notes = freezeWire(wireClone(notes))
     this.userRow = freezeWire(wireClone(userRow))
     this.historyUserRow = freezeWire(wireClone({
       ...userRow, content: stripTurnReferenceContent(userRow.content, referenceContent)
@@ -107,6 +108,7 @@ export class CacheTurn {
   block() {
     if (this.mode === 'agent') {
       const block = { replayVersion: 3, mode: 'agent', referenceVersion: 2, turnId: this.turnId,
+        ...(this.taskOutcomes?.length ? { taskOutcomes: wireClone(this.taskOutcomes) } : {}),
         apiRows: [this.historyUserRow, ...this.agentTail, ...(this.finalAssistant ? [this.finalAssistant] : [])],
         messageIds: [this.messageId].filter(Boolean), delivery: wireClone(this.delivery), exitReason: this.exitReason }
       validateToolRows(block.apiRows)
@@ -120,6 +122,8 @@ export class CacheTurn {
     const chatReply = this.finalReply ? [{ ...this.finalReply, ...(this.finalReasoning ? { reasoning_content: this.finalReasoning } : {}) }] : []
     const chatRows = [...base, ...this.chatTail, ...chatReply]
     validateToolRows(toolRows)
-    return { turnId: this.turnId, referenceVersion: 2, toolRows, chatRows, messageIds: [this.messageId].filter(Boolean), tokens: Math.max(tokenEstimate(toolRows), tokenEstimate(chatRows)) }
+    return { turnId: this.turnId, referenceVersion: 2, toolRows, chatRows,
+      ...(this.taskOutcomes?.length ? { taskOutcomes: wireClone(this.taskOutcomes) } : {}),
+      messageIds: [this.messageId].filter(Boolean), tokens: Math.max(tokenEstimate(toolRows), tokenEstimate(chatRows)) }
   }
 }

@@ -619,13 +619,13 @@ export class ChatPlugin extends plugin {
                 .catch(err => { logger.error(`[知识库] 检索失败: ${err.message}`); return '' })
             : Promise.resolve(''),
           (this.config.personProfileInjection?.enabled && groupId && userId)
-            ? personProfileInjector.build(groupId, userId, e).catch(err => { logger.error(`[画像注入] 失败: ${err.message}`); return '' })
+            ? personProfileInjector.build(groupId, userId, e, { parts: useCacheV2 }).catch(err => { logger.error(`[画像注入] 失败: ${err.message}`); return '' })
             : Promise.resolve(''),
           this.getCurrentGroupContext(e).catch(err => { logger.error(`[群上下文] 获取失败: ${err.message}`); return { groupId: String(groupId || ''), groupName: '', groupNotice: '' } })
         ])
 
         // 构建增强系统提示
-        const enhancedPrompts = [emotionPrompt, memoryPrompt, groupMemoryPrompt, expressionPrompt, knowledgePrompt, personProfilePrompt].filter(Boolean).join('\n')
+        const enhancedPrompts = [emotionPrompt, memoryPrompt, groupMemoryPrompt, expressionPrompt, knowledgePrompt, personProfilePrompt?.full ?? personProfilePrompt].filter(Boolean).join('\n')
         const toolHistoryPrompt = await this.getToolHistoryPromptForGroup(groupId)
 
         // 获取机器人在当前群的真实身份信息(群名片可能被 changeCardTool 改过)
@@ -714,14 +714,15 @@ export class ChatPlugin extends plugin {
               participantList.splice(Math.max(0, participantList.length - 1), 0,
                 { qq: currentQQ, name: e?.sender?.card || e?.sender?.nickname || '未知用户', role: roleTagOf(e?.sender) || '[member]' })
             }
-            const participantsBlock = formatParticipants(participantList)
             const manager = getV2MessageManager(cacheConfig, { update: false })
             session.cacheTurn = await this.preparePromptCacheTurn({
               e, session, scope, header, userContent: userContent + avatar, manager, allowedTools, agentControls, config: cacheConfig,
+              participants: participantList,
+              profileMessages: personProfilePrompt?.recentMessages || [],
               references: {
                 '北京时间': "北京时间: " + new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }),
-                '今日在场成员': participantsBlock ? `发言人身份与QQ号（按昵称查询，戳人/禁言等需要QQ号时查此表）：\n${participantsBlock}` : '',
-                '角色状态': enhancedPrompts, '工具调用历史': toolHistoryPrompt,
+                '情绪': emotionPrompt, '用户记忆': memoryPrompt, '群记忆': groupMemoryPrompt,
+                '表达风格': expressionPrompt, '知识库': knowledgePrompt,
                 '群公告': groupContext.groupNotice, 'MCP扩展能力': mcpPrompts
               }
             })

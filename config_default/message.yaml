@@ -27,6 +27,10 @@ pluginSettings:
     rawMaxEvents: 20000
     rawMaxBytes: 33554432
     diagnostics: true
+    noteCompactChanges: 32
+    noteCompactTokens: 2048
+    toolHistoryTokens: 512
+    tailDump: false
     preserveForcedSubsets: true
     preserveFinalNoTools: true
   groupChatMemoryDays: 1

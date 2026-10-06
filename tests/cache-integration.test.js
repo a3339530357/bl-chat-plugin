@@ -9,6 +9,7 @@ import { buildPromptCacheHeaders, TURN_REFERENCE_START } from '../core/prompts.j
 import { bindCacheRequest } from '../core/cacheTurn.js'
 import { originKeyForEvent, freezeWire } from '../core/promptCache.js'
 import { redisFixture } from './helpers/redis-fixture.js'
+import { replayRows } from '../core/replayAdapters.js'
 
 globalThis.logger = { debug() {}, info() {}, warn() {}, error() {} }
 const { YTapi } = await import('../utils/apiClient.js')
@@ -85,13 +86,13 @@ async function context() {
   return { store, scope, config, header, owner, states, manager, makeEvent, prepare, request }
 }
 
-test('real Redis + HTTP preserve clean history and tool bytes while references remain current-turn only', async () => {
+test('real Redis + HTTP preserve clean turn/tool bytes and carry scoped data in separate annotations', async () => {
   requests.length = 0
   toolCalls = 0
   const ctx = await context()
   const observer = ctx.makeEvent('observer')
   await ctx.manager.recordMessage(observer)
-  ctx.states.set('observer', { text: 'processing' })
+  ctx.states.set('observer', { status: 'processing', messageId: 'observer' })
   const e1 = ctx.makeEvent('current-one', 'user-one')
   const first = await ctx.prepare(e1, { emotion: 'happy', memory: 'user-one likes music', time: 'first time' })
   const firstUserBytes = first.userRow.content
@@ -122,29 +123,31 @@ test('real Redis + HTTP preserve clean history and tool bytes while references r
   } })
   await ctx.owner.commitPromptCacheTurn({ cacheTurn: first }, { _promptCacheDeliveryIds: ['bot-reply'] })
   await ctx.manager.recordMessage(ctx.makeEvent('new-bystander'))
-  ctx.states.set('observer', { text: 'tool_success' })
+  ctx.states.set('observer', { status: 'tool_success', toolName: 'probe', messageId: 'observer' })
   const second = await ctx.prepare(ctx.makeEvent('current-two', 'user-two'), { emotion: 'sad', memory: 'user-two likes books', time: 'second time' })
   assert.equal(first.userRow.content, firstUserBytes)
   const storedToolRequest = toolRequest.messages.map((row, index) => index === first.toolBase.length - 1 ? first.historyUserRow : row)
   const storedChatRequest = chatRequest.messages.map((row, index) => index === first.chatBase.length - 1 ? first.historyUserRow : row)
-  assert.deepEqual(second.toolBase.slice(0, first.toolBase.length - 1), toolRequest.messages.slice(0, first.toolBase.length - 1))
-  assert.deepEqual(second.toolBase.slice(0, storedToolRequest.length), storedToolRequest)
-  assert.deepEqual(second.chatBase.slice(0, storedChatRequest.length), storedChatRequest)
-  assert.equal(second.toolBase.some(row => row.content?.includes('user-one likes music')), false)
+  const originalRows = view => [{ role: 'system', content: view === 'tools' ? second.header.toolSystem : second.header.chatSystem },
+    ...second.snapshot.blocks.filter(block => !block.contextNotes).flatMap(block => replayRows(block, view))]
+  assert.deepEqual(originalRows('tools').slice(0, storedToolRequest.length), storedToolRequest)
+  assert.deepEqual(originalRows('chat').slice(0, storedChatRequest.length), storedChatRequest)
+  assert.ok(second.toolBase.some(row => row.content?.includes('QQ=user-one memory="user-one likes music"')))
+  assert.equal(second.userRow.content.includes('user-one likes music'), false)
   assert.equal(second.chatBase.some(row => row.content?.includes('first time')), false)
   assert.equal(second.chatBase.find(row => row.content === 'reply').reasoning_content, 'exact final reasoning bytes')
   assert.equal(second.toolBase.find(row => row.content === 'reply').reasoning_content, undefined)
-  assert.ok(second.userRow.content.includes('tool_success'))
+  assert.ok(second.userRow.content.includes('probe=success'))
   assert.ok(second.userRow.content.includes('user-two'))
   assert.equal(second.toolBase.filter(row => row.content === 'reply').length, 1)
   assert.ok(second.toolBase.some(row => row.content?.includes('new-bystander')))
   await YTapi(ctx.request(second, [...second.toolBase], 'none'), ctx.config)
   assert.equal(requests.at(-2).tool_choice, 'none')
   assert.deepEqual(requests.at(-2).tools, [declaration])
-  assert.deepEqual(second.chatBase.slice(0, storedChatRequest.length), storedChatRequest)
+  assert.deepEqual(originalRows('chat').slice(0, storedChatRequest.length), storedChatRequest)
 })
 
-test('six committed turns replay only body text and keep exactly one current reference in each request stage', async () => {
+test('six turns keep one transient reference wrapper and compact changing data without rewriting conversation rows', async () => {
   const ctx = await context()
   let previousHistory = []
   for (let index = 0; index < 6; index++) {
@@ -162,10 +165,11 @@ test('six committed turns replay only body text and keep exactly one current ref
     await ctx.owner.commitPromptCacheTurn({ cacheTurn: turn }, {})
     const snapshot = await ctx.store.read(ctx.scope, ctx.header, turn.settings)
     for (const block of snapshot.blocks) {
-      for (const row of [...block.toolRows, ...block.chatRows]) assert.equal(row.content?.includes(TURN_REFERENCE_START), false)
+      for (const row of [...replayRows(block, 'tools'), ...replayRows(block, 'chat')]) assert.equal(row.content?.includes(TURN_REFERENCE_START), false)
     }
-    previousHistory = snapshot.blocks.flatMap(block => block.toolRows)
-    assert.ok(JSON.stringify(snapshot.blocks).length < turn.userRow.content.length)
+    previousHistory = snapshot.blocks.flatMap(block => replayRows(block, 'tools'))
+    assert.equal(snapshot.blocks.at(-1).toolRows[0].content, content)
+    assert.ok(snapshot.blocks.filter(block => block.contextNotes).length <= 4)
   }
 })
 

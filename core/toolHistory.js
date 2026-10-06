@@ -6,6 +6,8 @@
 // 成败判定用 hasExplicitErrorMarker（严格版，零误判），不用带中文模糊匹配的 isToolResultError。
 
 import { hasExplicitErrorMarker } from "./toolResult.js"
+import { replayToolResults } from './replayCoverage.js'
+import { tokenEstimate } from './promptCache.js'
 
 const TOOL_HISTORY_PREFIX = "ytbot:tool_history:"
 const toolHistoryCache = new Map()
@@ -17,6 +19,55 @@ function truncateResult(text, max) {
   const s = typeof text === "string" ? text : String(text ?? "")
   if (!s) return ""
   return s.length > max ? s.slice(0, max) + "...(已截断)" : s
+}
+
+export function toolHistoryFacts(records, snapshot, budget = 512) {
+  const receipts = replayToolResults(snapshot.blocks)
+  const consumed = new Set()
+  const pending = []
+  for (const record of records) for (const [index, tool] of (record.tools || []).entries()) {
+    const result = String(tool.result || '')
+    const matched = record.messageId && !result.endsWith('...(已截断)') ? receipts.findIndex((receipt, i) => !consumed.has(i) &&
+      receipt.messageIds.includes(String(record.messageId)) && receipt.name === tool.toolName && receipt.result === result) : -1
+    if (matched >= 0) { consumed.add(matched); continue }
+    const failed = tool.success === false || hasExplicitErrorMarker(result)
+    const key = `history:${record.messageId || `time-${record.time}`}:${index}`
+    const value = { tool: tool.toolName, failed, result }
+    let detail = result
+    if (failed) {
+      try { const parsed = JSON.parse(result); if (parsed.error) detail = typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error) } catch {}
+    }
+    pending.push({ key, value, failed, detail, prefix: `工具 消息${record.messageId || '-'} ${tool.toolName}=${failed ? 'failed' : 'success'}` })
+  }
+  // Failure reasons take priority over success excerpts. Budget only novel
+  // summaries; unchanged notes are already present in the cached replay.
+  pending.sort((a, b) => Number(b.failed) - Number(a.failed))
+  let used = 0
+  const activeKeys = new Set(records.flatMap(record => (record.tools || []).map((_, index) => `history:${record.messageId || `time-${record.time}`}:${index}`)))
+  const facts = Object.keys(snapshot.noteState || {}).filter(key => key.startsWith('history:') && !activeKeys.has(key))
+    .map(key => ({ key, value: null, text: '', retired: true }))
+  for (const item of pending) {
+    const previous = snapshot.noteState?.[item.key]
+    if (previous?.valueJson === JSON.stringify(item.value) && snapshot.blocks.some(block => block.contextNotes?.some(entry => entry.key === item.key && entry.valueJson === previous.valueJson))) {
+      facts.push({ key: item.key, value: item.value, text: previous.text })
+      continue
+    }
+    const overhead = tokenEstimate(`v${snapshot.noteClock} ${item.prefix}\n`) + 4
+    const remaining = budget - used - overhead
+    if (remaining < 8) continue
+    const chars = Array.from(item.detail)
+    let low = 0; let high = Math.min(chars.length, item.failed ? 240 : 120)
+    while (low < high) {
+      const middle = Math.ceil((low + high) / 2)
+      if (tokenEstimate(chars.slice(0, middle).join('')) <= remaining) low = middle
+      else high = middle - 1
+    }
+    const excerpt = chars.slice(0, low).join('') + (low < chars.length ? '…' : '')
+    const text = `${item.prefix}${excerpt ? ` ${excerpt}` : ''}`
+    used += tokenEstimate(`v${snapshot.noteClock} ${text}\n`)
+    facts.push({ key: item.key, value: item.value, text })
+  }
+  return facts
 }
 
 // 老格式 record（每工具一条，无 tools 字段）兼容到新格式（每消息一条，tools 数组）
@@ -99,7 +150,7 @@ export const toolHistoryMethods = {
       .filter(it => it && it.toolName && !this.shouldSkipToolHistory(it.toolName))
       .map(it => ({
         toolName: it.toolName,
-        success: !hasExplicitErrorMarker(it.result),
+        success: !hasExplicitErrorMarker(it.result, { chinese: false }),
         result: truncateResult(it.result, maxResultLength)
       }))
     if (!subItems.length) return

@@ -5,7 +5,8 @@ import http from 'node:http'
 import { once } from 'node:events'
 import { redisFixture } from './helpers/redis-fixture.js'
 import { contextStore, ContextStore } from '../core/contextStore.js'
-import { wireClone, originKeyForEvent } from '../core/promptCache.js'
+import { wireClone, originKeyForEvent, tokenEstimate } from '../core/promptCache.js'
+import { TURN_REFERENCE_START } from '../core/prompts.js'
 
 register('./helpers/yunzai-cache-loader.mjs', import.meta.url)
 globalThis.plugin = class {}
@@ -55,7 +56,7 @@ after(async () => {
 })
 
 async function workflow({ enabled = true, currentMode = 'text', message = 'hello', tool = 'probe', video = false, groupId, useTools = true,
-  textImage = false, store = null, identityFailure = false, singleStage = false, sendFailure = false, configure, afterDispatch } = {}) {
+  textImage = false, store = null, identityFailure = false, singleStage = false, sendFailure = false, dedupe = false, configure, afterDispatch } = {}) {
   mode = currentMode
   selectedTool = tool
   decisions = 0
@@ -84,7 +85,7 @@ async function workflow({ enabled = true, currentMode = 'text', message = 'hello
   owner.REDIS_KEY_PREFIX = 'ytbot:messages:'
   owner.TASK_STATUS_PREFIX = 'ytbot:tool_task_status:'
   owner.MAX_HISTORY = 30
-  owner.dedupeToolNames = new Set()
+  owner.dedupeToolNames = new Set(dedupe ? ['probe'] : [])
   owner.refreshLocalToolRegistry = async () => {}
   owner.waitForMCPReady = async () => {}
   owner.getCurrentGroupContext = async () => ({ groupId: group, groupName: 'Group', groupNotice: 'current notice' })
@@ -150,6 +151,31 @@ test('actual agent text sends one request with full current data and commits raw
   assert.ok(!block.apiRows[0].content.includes('本轮参考资料'))
   assert.equal(result.replies.length, 1)
   assert.equal(block.delivery.status, 'sent')
+})
+
+test('unchanged second/third agent turns omit reference data and reuse their frozen prefix', async () => {
+  const first = await workflow({ singleStage: true })
+  const second = await workflow({ singleStage: true, groupId: first.group, message: 'second' })
+  const tail = second.session.cacheTurn.userRow.content
+  for (const old of ['current mood', 'user memory', 'group memory', 'current style', 'reference knowledge', 'current notice', '成员 ']) assert.equal(tail.includes(old), false)
+  assert.ok(tail.includes('"currentUserQQ":"42"'))
+  assert.ok(tail.includes('"allowedTools"'))
+  const third = await workflow({ singleStage: true, groupId: first.group, message: 'third' })
+  const base = second.session.cacheTurn.agentBase
+  assert.deepEqual(third.session.cacheTurn.agentBase.slice(0, base.length - 1), base.slice(0, -1))
+  assert.ok(third.session.cacheTurn.agentBase.some(row => row.content?.includes('user memory')))
+  const tailTokens = item => tokenEstimate(item.session.cacheTurn.userRow.content.slice(item.session.cacheTurn.userRow.content.indexOf(TURN_REFERENCE_START)))
+  assert.ok(tailTokens(second) < tailTokens(first))
+  console.log(`tail-slim token estimate: first=${tailTokens(first)}, unchanged=${tailTokens(second)}, third=${tailTokens(third)}`)
+})
+
+test('actual dedupe tool outcome is recorded and suppresses both terminal facts and duplicate history', async () => {
+  const first = await workflow({ singleStage: true, currentMode: 'tool', dedupe: true })
+  assert.equal(first.session.cacheTurn.taskOutcomes.length, 1)
+  assert.equal(first.session.cacheTurn.block().taskOutcomes[0].status, 'tool_success')
+  const second = await workflow({ singleStage: true, groupId: first.group, dedupe: true, message: 'after the tool' })
+  assert.equal(second.session.cacheTurn.userRow.content.includes('probe=success'), false)
+  assert.equal(second.session.cacheTurn.userRow.content.includes('工具 消息'), false)
 })
 
 test('actual agent native tool continuation uses two requests and terminal uses one', async () => {

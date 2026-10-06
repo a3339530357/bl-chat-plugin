@@ -7,18 +7,21 @@
 
 const FUZZY_FAILURE_MAX_LENGTH = 100
 
-export function hasExplicitErrorMarker(text) {
+export function hasExplicitErrorMarker(text, { chinese = true } = {}) {
   if (typeof text !== "string") return false
   const trimmed = text.trim()
   if (!trimmed) return false
   if (/^error[:：]/i.test(trimmed)) return true
+  if (chinese && /^(?:搜索|检索|查询|请求|调用|执行|下载|上传|发送|解析|生成|获取|操作)(?:失败|错误)\s*[:：]/.test(trimmed)) return true
   if (/"error"\s*:/.test(trimmed)) return true
   return false
 }
 
 export function isToolResultError(result) {
   const text = typeof result === "string" ? result : JSON.stringify(result ?? "")
-  if (hasExplicitErrorMarker(text)) return true
+  // Keep the pre-existing V1 execution classifier unchanged. V2 history uses
+  // the explicit Chinese-prefix correction without changing shared storage.
+  if (hasExplicitErrorMarker(text, { chinese: false })) return true
   const trimmed = text.trim()
   return trimmed.length > 0 &&
     trimmed.length <= FUZZY_FAILURE_MAX_LENGTH &&

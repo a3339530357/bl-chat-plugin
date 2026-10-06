@@ -162,14 +162,16 @@ export const toolExecutorMethods = {
       const result = this.serializeToolResult(isTerminal ? rawResult.result : rawResult)
       if (dedupeEnabled && toolRunValue.messageId) {
         const failed = isToolResultError(result)
-        await this.saveTaskStatus({
+        const outcome = await this.saveTaskStatus({
           groupId: e.group_id,
           userId: e.user_id,
           messageId: toolRunValue.messageId,
           status: failed ? "tool_failed" : "tool_success",
           toolName,
+          ...(session.cacheTurn ? { toolCallId: toolCall.id } : {}),
           error: failed ? result : ""
         })
+        if (session.cacheTurn && outcome) (session.cacheTurn.taskOutcomes ||= []).push({ ...outcome, toolCallId: toolCall.id })
       }
       const finalResult = result?.trim() ? result : `工具 ${toolName} 执行成功`
       if (toolName !== "waitTool" && !isToolResultError(finalResult)) {
@@ -184,14 +186,16 @@ export const toolExecutorMethods = {
       }
     } catch (error) {
       if (dedupeEnabled && toolRunValue.messageId) {
-        await this.saveTaskStatus({
+        const outcome = await this.saveTaskStatus({
           groupId: e.group_id,
           userId: e.user_id,
           messageId: toolRunValue.messageId,
           status: "tool_failed",
           toolName,
+          ...(session.cacheTurn ? { toolCallId: toolCall.id } : {}),
           error: error.message
         })
+        if (session.cacheTurn && outcome) (session.cacheTurn.taskOutcomes ||= []).push({ ...outcome, toolCallId: toolCall.id })
       }
       logger.error(`[工具调用] ${toolName} 执行失败:`, error)
       return {

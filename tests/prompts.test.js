@@ -1,5 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { legacyReferenceContent } from './helpers/legacy-reference.js'
 import {
   buildChatSystemPrompt, buildPromptCacheHeaders, buildTurnReferenceContent,
   stripTurnReferenceContent, stripHistoricalTurnReferences, TURN_REFERENCE_START, TURN_REFERENCE_END
@@ -86,8 +87,7 @@ test('reference stripping preserves literal anchors in user input and nested mar
 })
 
 test('legacy cleanup requires matching turn/message metadata and complete generated footer', () => {
-  const reference = buildTurnReferenceContent(referenceOptions)
-  const legacy = '\n\n' + reference.slice(TURN_REFERENCE_START.length, -TURN_REFERENCE_END.length)
+  const legacy = legacyReferenceContent(referenceOptions)
   const body = 'a pasted 【本轮参考资料】 title stays in user text'
   const row = { role: 'user', content: body + legacy }
   const reply = { role: 'assistant', content: 'reply', reasoning_content: 'retained reasoning' }
@@ -111,4 +111,21 @@ test('only V2 system rules declare reference snapshots ephemeral', () => {
   assert.ok(header.chatSystem.includes('本轮参考资料不进入历史回放'))
   assert.ok(!header.toolSystem.includes('历史快照和工具收尾提示'))
   assert.ok(!buildChatSystemPrompt(baseParams).includes('本轮参考资料不进入历史回放'))
+})
+
+test('compact metadata retains current identity and grants all only for equal declaration/permission sets', () => {
+  const render = (allowedTools, declaredTools) => {
+    const content = buildTurnReferenceContent({ ...referenceOptions, allowedTools, declaredTools })
+    return { content, metadata: JSON.parse(content.split('\n').find(line => line.startsWith('{'))) }
+  }
+  const full = render(['b', 'a', 'a'], ['a', 'b'])
+  assert.equal(full.metadata.allowedTools, 'all')
+  assert.equal(full.metadata.currentUserQQ, '42')
+  assert.equal(full.metadata.targetMessageId, 'message-one')
+  assert.equal('turnId' in full.metadata, false)
+  assert.equal('asOf' in full.metadata, false)
+  assert.deepEqual(render(['a'], ['a', 'voiceTool']).metadata.allowedTools, ['a'])
+  assert.deepEqual(render(['a', 'missing'], ['a']).metadata.allowedTools, ['a', 'missing'])
+  assert.deepEqual(render([], []).metadata.allowedTools, [])
+  assert.deepEqual(render([], ['a']).metadata.allowedTools, [])
 })

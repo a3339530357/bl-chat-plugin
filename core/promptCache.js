@@ -35,6 +35,9 @@ export function promptCacheSettings(config = {}) {
     rawMaxEvents: Math.max(100, finiteSetting(value.rawMaxEvents, 20000)),
     rawMaxBytes: Math.max(1048576, finiteSetting(value.rawMaxBytes, 33554432)),
     diagnostics: value.diagnostics !== false,
+    noteCompactChanges: Math.max(2, finiteSetting(value.noteCompactChanges, 32)),
+    noteCompactTokens: Math.max(256, finiteSetting(value.noteCompactTokens, 2048)),
+    toolHistoryTokens: Math.max(64, finiteSetting(value.toolHistoryTokens, 512)),
     preserveForcedSubsets: value.preserveForcedSubsets !== false,
     preserveFinalNoTools: value.preserveFinalNoTools !== false
   }

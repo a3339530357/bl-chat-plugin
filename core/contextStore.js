@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { beijingDay, tokenEstimate, replayEventRow } from './promptCache.js'
 import { stripHistoricalTurnReferences } from './prompts.js'
 import { ContextStoreError, nativeReplayRows, replayFormat, replayRows, REPLAY_RENDERER_VERSION } from './replayAdapters.js'
+import { contextNoteBlock } from './contextNotes.js'
 export { ContextStoreError, validateToolRows } from './replayAdapters.js'
 
 // Keep message/header JSON as strings in Lua: cjson round-trips [] as {}.
@@ -136,11 +137,24 @@ if total > tonumber(ARGV[5]) then
 end
 local kept = {}
 for index=dropped+1,#blocks do table.insert(kept, blocks[index]) end
+local noteState = redis.call('HGET', KEYS[5], 'contextNoteState') or '{}'
+local hasMembers = false
+for key, _ in pairs(cjson.decode(noteState)) do if string.sub(key, 1, 7) == 'member:' then hasMembers = true; break end end
+local identityEvents = {}
+if not hasMembers then
+  for _, encoded in ipairs(redis.call('ZRANGE', KEYS[3], 0, -1)) do
+    local event = cjson.decode(encoded)
+    local payload = cjson.decode(event.payload)
+    table.insert(identityEvents, {seq=event.seq, message={sender=payload.message and payload.message.sender}})
+  end
+end
+local noteClock = redis.call('HINCRBY', KEYS[5], 'contextNoteClock', 1)
 ${EXPIRE}
 return cjson.encode({cursor=cursor, readUntil=untilSeq, events=decodedEvents, blocks=kept,
   header=header, headerChanged=changed, modeChanged=previousMode and previousMode~=ARGV[11] or false,
   firstModeUse=not previousMode, projectionChanged=projectionChanged, dropped=dropped, estimatedTokens=total,
-  rawCount=redis.call('ZCARD', KEYS[3]), rawBytes=tonumber(redis.call('HGET', KEYS[5], 'rawBytes') or '0')})`
+  rawCount=redis.call('ZCARD', KEYS[3]), rawBytes=tonumber(redis.call('HGET', KEYS[5], 'rawBytes') or '0'),
+  noteState=noteState, noteClock=noteClock, identityEvents=identityEvents})`
 
 const COMMIT = `${GUARD}
 if redis.call('HEXISTS', KEYS[8], ARGV[4]) == 1 then return cjson.encode({duplicate=true}) end
@@ -152,6 +166,29 @@ local turn = cjson.decode(ARGV[7])
 local replayCount = redis.call('LLEN', KEYS[6])
 local referencesClean = tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1') == replayCount
 local budgetsKnown = tonumber(redis.call('HGET', KEYS[5], 'agentBudgetCount') or '-1') == replayCount
+local state = cjson.decode(redis.call('HGET', KEYS[5], 'contextNoteState') or '{}')
+local visible = {}
+local notes = cjson.decode(ARGV[10] or '[]')
+if #notes > 0 then
+  for _, encoded in ipairs(redis.call('LRANGE', KEYS[6], 0, -1)) do
+    for _, entry in ipairs(cjson.decode(encoded).contextNotes or {}) do
+      if not visible[entry.key] or entry.version >= visible[entry.key].version then visible[entry.key] = entry end
+    end
+  end
+end
+for _, candidate in ipairs(notes) do
+  local entry = cjson.decode(candidate.entryJson)
+  local previous = state[entry.key] and cjson.decode(state[entry.key])
+  if not previous or entry.version >= previous.version then
+    if not entry.retired and (not visible[entry.key] or visible[entry.key].valueJson ~= entry.valueJson) then
+      redis.call('RPUSH', KEYS[6], candidate.blockJson)
+      redis.call('HSET', KEYS[7], candidate.eventId, '1')
+      visible[entry.key] = entry
+    end
+    state[entry.key] = candidate.entryJson
+  end
+end
+redis.call('HSET', KEYS[5], 'contextNoteState', cjson.encode(state))
 local incoming = {}
 for _, candidate in ipairs(candidates) do
   if redis.call('HEXISTS', KEYS[7], candidate.eventId) == 0 then table.insert(incoming, candidate) end
@@ -170,6 +207,20 @@ if budgetsKnown and turn.mode == 'agent' then redis.call('HSET', KEYS[5], 'agent
 redis.call('HSET', KEYS[8], ARGV[4], '1')
 ${EXPIRE}
 return cjson.encode({cursor=math.max(cursor, untilSeq), concurrentMerge=cursor~=tonumber(ARGV[9])})`
+
+// Compression is the only operation allowed to rewrite the note prefix. Keep
+// every conversation/tool block verbatim and CAS the entire captured replay.
+const COMPACT_NOTES = `${GUARD}
+local before = cjson.decode(ARGV[4]); local after = cjson.decode(ARGV[5])
+if redis.call('HGET', KEYS[5], 'contextNoteState') ~= ARGV[6] or redis.call('LLEN', KEYS[6]) ~= #before then return cjson.encode({retry=true}) end
+for index, encoded in ipairs(before) do
+  if redis.call('LINDEX', KEYS[6], index-1) ~= encoded then return cjson.encode({retry=true}) end
+end
+redis.call('DEL', KEYS[6])
+for _, encoded in ipairs(after) do redis.call('RPUSH', KEYS[6], encoded) end
+redis.call('HSET', KEYS[5], 'replayCount', #after, 'referenceCleanCount', '-1', 'agentBudgetCount', '-1')
+${EXPIRE}
+return cjson.encode({compacted=true})`
 
 const RESET = `${CLOCK}
 if now >= tonumber(ARGV[2]) then return cjson.encode({error='expired_scope'}) end
@@ -265,7 +316,7 @@ export class ContextStore {
     ])
   }
 
-  async read(scope, header, settings, incomingTokens = 0, currentOrigin = '') {
+  async read(scope, header, settings, incomingTokens = 0, currentOrigin = '', compactAttempt = 0) {
     await this.cleanHistoricalReferences(scope)
     if (header.mode === 'agent') await this.prepareAgentBudgets(scope)
     const result = await this.evaluate(READ, this.keys(scope).slice(0, 7), [
@@ -276,9 +327,28 @@ export class ContextStore {
     // Redis cjson encodes an empty Lua array as {}, not [].
     result.events = Array.isArray(result.events)
       ? result.events.map(event => ({ ...JSON.parse(event.payload), seq: event.seq, represented: event.represented })) : []
-    result.blocks = Array.isArray(result.blocks) ? result.blocks.map(block => JSON.parse(block)) : []
+    const encodedBlocks = Array.isArray(result.blocks) ? result.blocks : []
+    result.blocks = encodedBlocks.map(block => JSON.parse(block))
     result.blocks.forEach(nativeReplayRows)
     result.header = JSON.parse(result.header)
+    const encodedState = result.noteState
+    result.noteState = Object.fromEntries(Object.entries(JSON.parse(encodedState)).map(([key, value]) => [key, JSON.parse(value)]))
+    result.identityEvents = Array.isArray(result.identityEvents) && result.identityEvents.length ? result.identityEvents : result.events
+    const notes = result.blocks.filter(block => block.contextNotes)
+    const deltaNotes = notes.filter(block => !block.contextBaseline)
+    const compact = deltaNotes.length >= (settings.noteCompactChanges || 32) ||
+      deltaNotes.reduce((sum, block) => sum + block.tokens, 0) >= (settings.noteCompactTokens || 2048)
+    if (compact && notes.length > 1 && compactAttempt < 3) {
+      const baseline = contextNoteBlock(Object.values(result.noteState).filter(entry => !entry.retired).sort((a, b) => a.key.localeCompare(b.key)), { baseline: true })
+      const after = [JSON.stringify(baseline), ...encodedBlocks.filter((_, index) => !result.blocks[index].contextNotes)]
+      const compressed = await this.evaluate(COMPACT_NOTES, this.keys(scope).slice(0, 7),
+        [...this.args(scope), JSON.stringify(encodedBlocks), JSON.stringify(after), encodedState])
+      const refreshed = await this.read(scope, header, settings, incomingTokens, currentOrigin, compactAttempt + 1)
+      return { ...refreshed, headerChanged: result.headerChanged || refreshed.headerChanged,
+        modeChanged: result.modeChanged || refreshed.modeChanged, projectionChanged: result.projectionChanged || refreshed.projectionChanged,
+        firstModeUse: result.firstModeUse || refreshed.firstModeUse, dropped: result.dropped + refreshed.dropped,
+        notesCompacted: compressed.compacted || refreshed.notesCompacted || false }
+    }
     return result
   }
 
@@ -315,13 +385,15 @@ export class ContextStore {
     throw new ContextStoreError('reference_migration_conflict')
   }
 
-  async commit(scope, { turnId, readUntil, baseCursor, observers, block, represented = [] }) {
+  async commit(scope, { turnId, readUntil, baseCursor, observers, block, represented = [], notes = [] }) {
     nativeReplayRows(block)
     observers.forEach(observer => nativeReplayRows(observer.block))
+    notes.forEach(note => nativeReplayRows(note.block))
     return this.evaluate(COMMIT, this.keys(scope), [
       ...this.args(scope), turnId, readUntil,
       JSON.stringify(observers.map(observer => ({ eventId: observer.eventId, blockJson: JSON.stringify(observer.block) }))),
-      JSON.stringify(block), JSON.stringify(represented), baseCursor
+      JSON.stringify(block), JSON.stringify(represented), baseCursor,
+      JSON.stringify(notes.map(note => ({ eventId: note.eventId, entryJson: JSON.stringify(note.entry), blockJson: JSON.stringify(note.block) })))
     ])
   }
 
