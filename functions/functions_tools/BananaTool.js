@@ -51,6 +51,9 @@ export class BananaTool extends AbstractTool {
 
     // 处理图片
     const images = await normalizeImageUrls(this.normalizeArray(rawImages));
+
+    // 画图要几分钟，先给群里发条提示免得像卡死
+    try { await e.reply('在画了在画了，要几分钟，稍等~') } catch {}
     const { imageEditApiUrl: apiUrl, imageEditApiKey: apiKey, imageEditApiModel: model } =
       config.imageEditAiConfig || {};
     const finalUrl = apiUrl || 'https://api.openai.com/v1/chat/completions';

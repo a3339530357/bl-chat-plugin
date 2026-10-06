@@ -57,6 +57,9 @@ export class GoogleImageEditTool extends AbstractTool {
                 return { error: '未检测到有效的图片链接' };
             }
 
+            // 编辑图要几分钟，先给群里发条提示免得像卡死
+            try { await e.reply('在改图了，要几分钟，好了直接发出来~') } catch {}
+
             const endpoint = resolveImageEndpoint(apiUrl, true);
             let processedUrl;
 
