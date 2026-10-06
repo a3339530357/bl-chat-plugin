@@ -70,7 +70,7 @@ test('turn reference anchors delimit all current data and strip exactly the gene
   const reference = buildTurnReferenceContent(referenceOptions)
   assert.ok(reference.startsWith(TURN_REFERENCE_START))
   assert.ok(reference.endsWith(TURN_REFERENCE_END))
-  for (const value of ['current time', 'current memory', 'current processing', 'message-one', '42', 'probe']) assert.ok(reference.includes(value))
+  for (const value of ['current time', 'current memory', 'current processing', '42', 'probe']) assert.ok(reference.includes(value))
   const body = 'quoted message and https://example.test/image.png\n\n'
   assert.equal(stripTurnReferenceContent(body + reference, reference), body)
   assert.equal(stripTurnReferenceContent(body, reference), body)
@@ -121,7 +121,7 @@ test('compact metadata retains current identity and grants all only for equal de
   const full = render(['b', 'a', 'a'], ['a', 'b'])
   assert.equal(full.metadata.allowedTools, 'all')
   assert.equal(full.metadata.currentUserQQ, '42')
-  assert.equal(full.metadata.targetMessageId, 'message-one')
+  assert.equal('targetMessageId' in full.metadata, false)
   assert.equal('turnId' in full.metadata, false)
   assert.equal('asOf' in full.metadata, false)
   assert.deepEqual(render(['a'], ['a', 'voiceTool']).metadata.allowedTools, ['a'])

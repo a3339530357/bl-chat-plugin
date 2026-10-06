@@ -28,7 +28,7 @@ export const sessionHistoryMethods = {
     })
     const origin = originKeyForEvent(e)
     const preliminary = buildTurnReferenceContent({
-      userId: e.user_id, messageId: e.message_id,
+      userId: e.user_id,
       references: { time: references['北京时间'] || references.time }, allowedTools, agentControls, declaredTools: header.tools
     })
     const agent = header.mode === 'agent'
@@ -83,7 +83,7 @@ export const sessionHistoryMethods = {
       })
     }
     const referenceContent = buildTurnReferenceContent({
-      userId: e.user_id, messageId: e.message_id,
+      userId: e.user_id,
       references, allowedTools, newObserverCount, agentControls, declaredTools: snapshot.header.tools
     })
     const turn = new CacheTurn({
