@@ -219,15 +219,21 @@ pluginSettings:
     imageEditApiModel: gemini-3-pro-image-preview,
     imageEditApiKey: sk-xxxxx
   }
+  voiceAiConfig: {
+    ttsApiKey: '',
+    ttsApiUrl: https://api.siliconflow.cn/v1/audio/speech,
+    ttsModel: FunAudioLLM/CosyVoice2-0.5B,
+    ttsVoice: 'FunAudioLLM/CosyVoice2-0.5B:claire'
+  }
   analysisAiConfig: {
     analysisApiUrl: https://api.openai.com/v1/chat/completions,
     analysisApiModel: gemini-3-pro-preview,
     analysisApiKey: sk-xxxxx
   }
   searchAiConfig: {
-    searchApiUrl: https://api.openai.com/v1/chat/completions,
-    searchApiModel: deepseek-r1-search,
-    searchApiKey: sk-xxxxx
+    searchProvider: zhipu_mcp,
+    zhipuMcpUrl: https://open.bigmodel.cn/api/mcp/web_search_prime/mcp,
+    zhipuApiKey: ''
   }
   memoryAiConfig: {
     memoryAiUrl: https://api.openai.com/v1/chat/completions,

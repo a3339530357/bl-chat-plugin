@@ -1,6 +1,5 @@
 import { AbstractTool } from './AbstractTool.js';
 import { TotalTokens } from "../../functions/tools/CalculateToken.js";
-import { callAI } from "../../utils/apiClient.js";
 import fs from "fs";
 import YAML from "yaml";
 import path from "path";
@@ -119,31 +118,88 @@ export class SearchInformationTool extends AbstractTool {
       const configPath = path.join(process.cwd(), 'plugins/bl-chat-plugin/config/message.yaml');
       const configFile = fs.readFileSync(configPath, 'utf8');
       const config = YAML.parse(configFile).pluginSettings;
+      const sc = config.searchAiConfig || {}
 
-      const apiUrl = config.searchAiConfig?.searchApiUrl || 'https://api.openai.com/v1/chat/completions'
-      const apiKey = config.searchAiConfig?.searchApiKey || 'sk-xxxxxx'
-      const apiModel = config.searchAiConfig?.searchApiModel || 'deepseek-r1-search'
-
-      const result = await callAI(
-        {
-          url: apiUrl,
-          model: apiModel,
-          apikey: apiKey
-        },
-        [{ role: "user", content: "请联网搜索：" + query }],
-        { stream: false, temperature: 0.2 }
-      )
-
-      if (result.error) {
-        return `搜索失败：${result.error}`
+      // 智谱 MCP web_search_prime（Coding Plan 套餐内免费；REST 按量端点不通用会报 1113）
+      // 曾有百炼 qwen-plus 回退路，账号关停后已移除（2026-10-06）
+      const mcp = await this.zhipuMcpSearch(sc, query)
+      if (mcp.ok) {
+        return mcp.text + '\n\n提示：如果用户想基于搜索结果制作文件，可以使用 aiMindMapTool 工具继续操作。'
       }
-
-      const content = result?.choices?.[0]?.message?.content || '未找到相关搜索结果'
-      return content + '\n\n提示：如果用户想基于搜索结果制作文件，可以使用 aiMindMapTool 工具继续操作。'
+      logger.warn(`[searchInformationTool] 搜索失败: ${mcp.error}`)
+      return `搜索失败：${mcp.error}（可换个说法再试；部分热点类关键词会触发内容过滤）`
 
     } catch (error) {
       console.error('搜索过程发生错误:', error);
       return `搜索失败：${error.message || '发生未知错误'}`;
+    }
+  }
+
+  /**
+   * 智谱 MCP web_search_prime 搜索（Coding Plan 套餐内免费）
+   * 协议：HTTP MCP —— initialize 拿 Mcp-Session-Id 响应头，再 tools/call，
+   * 响应为 SSE 流，结果字符串双层 JSON 编码需解两次。
+   * 坑：工具名必须是下划线的 web_search_prime（文档页的 webSearchPrime 会 Tool not found）；
+   *     查询词可能触发 1301 内容过滤（isError:true），由调用方回退处理。
+   */
+  async zhipuMcpSearch(sc, query) {
+    const mcpUrl = sc.zhipuMcpUrl || 'https://open.bigmodel.cn/api/mcp/web_search_prime/mcp'
+    const apiKey = sc.zhipuApiKey
+    if (!apiKey) return { ok: false, error: '未配置 searchAiConfig.zhipuApiKey' }
+    const headers = {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json, text/event-stream'
+    }
+    try {
+      // 1. initialize 换会话 ID（每次搜索新建会话，量小无需复用）
+      const init = await fetch(mcpUrl, {
+        method: 'POST', headers,
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 0, method: 'initialize',
+          params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'bl-chat-plugin', version: '1.0' } }
+        }),
+        signal: AbortSignal.timeout(15000)
+      })
+      const sessionId = init.headers.get('mcp-session-id')
+      if (!init.ok || !sessionId) return { ok: false, error: `initialize HTTP ${init.status}` }
+
+      // 2. tools/call 搜索
+      const call = await fetch(mcpUrl, {
+        method: 'POST', headers: { ...headers, 'Mcp-Session-Id': sessionId },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 2, method: 'tools/call',
+          params: { name: 'web_search_prime', arguments: { search_query: query, location: 'cn' } }
+        }),
+        signal: AbortSignal.timeout(30000)
+      })
+      if (!call.ok) return { ok: false, error: `tools/call HTTP ${call.status}` }
+
+      // 3. SSE 解析 + 双层 JSON
+      const raw = await call.text()
+      const dataLine = raw.split('\n').find(l => l.startsWith('data:'))
+      if (!dataLine) return { ok: false, error: '响应无 data 行' }
+      const payload = JSON.parse(dataLine.slice(5))
+      const result = payload?.result
+      if (!result || result.isError) {
+        return { ok: false, error: (result?.content?.[0]?.text || 'MCP error').slice(0, 120) }
+      }
+      const text = result.content?.[0]?.text
+      if (!text) return { ok: false, error: '结果为空' }
+      let results
+      try {
+        results = JSON.parse(JSON.parse(text))
+      } catch {
+        try { results = JSON.parse(text) } catch { return { ok: false, error: '结果JSON解析失败' } }
+      }
+      if (!Array.isArray(results) || !results.length) return { ok: false, error: '搜索结果为空' }
+
+      // 4. 拼成文本喂给主模型
+      const lines = results.slice(0, 8).map((r, i) =>
+        `[${i + 1}] ${(r.title || '').trim()}\n${(r.content || r.snippet || '').trim()}\n来源: ${r.link || ''}`)
+      return { ok: true, text: `联网搜索「${query}」的结果（${results.length} 条，取前 ${Math.min(results.length, 8)} 条）：\n\n${lines.join('\n\n')}` }
+    } catch (err) {
+      return { ok: false, error: err?.cause?.code || err.message || 'MCP请求异常' }
     }
   }
 }
