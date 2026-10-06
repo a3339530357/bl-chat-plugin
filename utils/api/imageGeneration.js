@@ -120,9 +120,18 @@ export function buildImagesRequest(mode, prompt, base64Images, model, size) {
  * @param {BodyInit} body
  * @param {string} key API key
  */
+// 生图/改图上游实测 250s± 才出结果，超时必须给足；这里防的是「连接挂着不断开」的无限等待
+const IMAGE_API_TIMEOUT_MS = 420_000
+
 export async function postImageApi(url, headers, body, key) {
   const finalHeaders = { Authorization: `Bearer ${key}`, ...headers }
-  const res = await fetch(url, { method: 'POST', headers: finalHeaders, body })
+  let res
+  try {
+    res = await fetch(url, { method: 'POST', headers: finalHeaders, body, signal: AbortSignal.timeout(IMAGE_API_TIMEOUT_MS) })
+  } catch (error) {
+    if (error?.name === 'TimeoutError' || error?.name === 'AbortError') throw new Error('图片服务响应超时（7分钟无结果），请稍后再试')
+    throw error
+  }
   const text = await res.text()
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} ${res.statusText || ''} ｜ ${summarizeBody(text)}`)

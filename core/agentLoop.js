@@ -120,9 +120,20 @@ export const agentLoopMethods = {
             }
             if (category === 'light' && !controls.explicitTools.includes(name) && controls.policy !== 'legacy') autonomousUsed++
             if (!reservedRound) { toolRounds++; reservedRound = true }
+            let hardTimeout
             try {
-              return await this.runToolCall(call, e, session, senderRole) || rejected('error: tool dispatch returned no result')
-            } catch { return rejected('error: tool dispatch failed; do not automatically repeat the action') }
+              // 硬熔断兜底：个别工具内部裸 fetch 挂死时（如改图上游连接不断开），
+              // 不让整轮对话无限等。超时后底层调用仍在后台进行，结果被丢弃。
+              const run = Promise.resolve(this.runToolCall(call, e, session, senderRole))
+              const result = await Promise.race([
+                run,
+                new Promise((_, fail) => { hardTimeout = setTimeout(() => fail(new Error('tool_hard_timeout')), 600_000) })
+              ])
+              return result || rejected('error: tool dispatch returned no result')
+            } catch (error) {
+              if (error?.message === 'tool_hard_timeout') return rejected('error: tool timed out after 10 minutes; wrap up naturally and do not retry immediately')
+              return rejected('error: tool dispatch failed; do not automatically repeat the action')
+            } finally { clearTimeout(hardTimeout) }
           })
           const batch = await Promise.all(pending)
           results.push(...batch)
