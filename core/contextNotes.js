@@ -1,4 +1,4 @@
-import { tokenEstimate } from './promptCache.js'
+import { tokenEstimate, botIdForEvent } from './promptCache.js'
 import { nativeReplayRows } from './replayAdapters.js'
 
 // Facts are versioned independently of source messages. Hashes are deliberately
@@ -22,8 +22,13 @@ export function contextNoteBlock(entries, { baseline = false } = {}) {
 export function participantFacts(snapshot, participants = [], e = {}) {
   const people = new Map()
   for (const [key, entry] of Object.entries(snapshot.noteState || {})) {
-    if (key.startsWith('member:')) people.set(key.slice(7), JSON.parse(entry.valueJson))
+    if (key.startsWith('member:') && !entry.retired && entry.valueJson !== 'null') people.set(key.slice(7), JSON.parse(entry.valueJson))
   }
+  const active = new Set([
+    ...participants.map(person => person.qq),
+    ...(snapshot.events || []).map(event => event.message?.sender?.user_id),
+    botIdForEvent(e), e.user_id
+  ].filter(value => value != null && String(value) !== '').map(String))
   const observed = new Set()
   const put = (qq, name, role, otherNames = []) => {
     if (qq == null || String(qq) === '' || !name) return
@@ -46,32 +51,53 @@ export function participantFacts(snapshot, participants = [], e = {}) {
   if (!people.has(String(e.user_id))) put(e.user_id, e.sender?.card || e.sender?.nickname || '未知用户', e.sender?.role === 'owner' ? '[群主]' : e.sender?.role === 'admin' ? '[管理]' : '[member]')
   // Keep the configured bot identity, including its bot marker.
   for (const person of participants.filter(person => person.role === '[bot]')) put(person.qq, person.name, person.role)
-  return [...people].sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true })).map(([qq, value]) => {
+  const facts = [...people].filter(([qq]) => active.has(qq)).sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true })).map(([qq, value]) => {
     const aliases = value.aliases.filter(name => name !== value.name)
     return { key: `member:${qq}`, value, observed: observed.has(qq),
       text: `成员 ${JSON.stringify(value.name)} QQ=${qq} ${value.role}${aliases.length ? ` 旧名=${JSON.stringify(aliases)}` : ''}` }
   })
+  // Keep only a versioned tombstone for departed subjects. In particular, do
+  // not keep their per-user profile/reference payloads inside every baseline.
+  for (const key of Object.keys(snapshot.noteState || {})) {
+    const subject = key.match(/^(?:member:|profile:|reference:QQ=)([^:]+)/)?.[1]
+    if (subject && !active.has(subject)) facts.push({ key, value: null, text: '', retired: true })
+  }
+  return facts
 }
 
 export function planContextNotes(snapshot, facts) {
   const visible = visibleContextNotes(snapshot.blocks)
-  const restoreMembers = facts.some(fact => fact.key.startsWith('member:') && snapshot.noteState?.[fact.key] &&
+  const restoreMembers = facts.some(fact => !fact.retired && fact.key.startsWith('member:') && snapshot.noteState?.[fact.key] &&
+    !snapshot.noteState[fact.key].retired && snapshot.noteState[fact.key].valueJson !== 'null' &&
     visible[fact.key]?.valueJson !== snapshot.noteState[fact.key].valueJson)
   const notes = []
   const updates = []
+  const unchangedNotes = []
   for (const fact of facts) {
     const previous = snapshot.noteState?.[fact.key]
     const valueJson = JSON.stringify(fact.value)
-    const changed = !previous || previous.valueJson !== valueJson
+    const changed = !previous || previous.valueJson !== valueJson || !!previous.retired !== !!fact.retired
+    // Null is a cancellation, not data that must be restored after compaction.
+    const missing = !fact.retired && (visible[fact.key]
+      ? visible[fact.key].valueJson !== valueJson : valueJson !== 'null')
+    const restore = !fact.retired && restoreMembers && fact.key.startsWith('member:')
+    // Do not render/tokenize/serialize an unchanged fact merely for Lua to
+    // discard it again. Already-retired tombstones are unchanged as well.
+    if (!changed && !missing && !restore) {
+      // Keep only a lazy local reference; the wire payload carries key/version
+      // acknowledgments, not another copy of the unchanged value and API block.
+      if (fact.observed !== false) unchangedNotes.push({ baseVersion: previous.version,
+        entry: { ...previous, version: snapshot.noteClock } })
+      continue
+    }
     const entry = { key: fact.key, valueJson, text: fact.text,
       version: changed || fact.observed !== false ? snapshot.noteClock : previous.version,
       ...(fact.retired ? { retired: true } : {}) }
-    const missing = visible[fact.key]?.valueJson !== valueJson
     const block = contextNoteBlock([entry])
     notes.push({ eventId: `note:${snapshot.noteClock}:${fact.key}`, entry, block })
-    if (!fact.retired && (changed || missing || (restoreMembers && fact.key.startsWith('member:')))) updates.push(entry)
+    if (!fact.retired) updates.push(entry)
   }
-  return { notes, updates, content: updates.map(entry => `v${entry.version} ${entry.text}`).join('\n') }
+  return { notes, unchangedNotes, updates, content: updates.map(entry => `v${entry.version} ${entry.text}`).join('\n') }
 }
 
 // Retrieval results are scoped to their subject. Absence after a nonempty

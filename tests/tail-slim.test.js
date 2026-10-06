@@ -50,7 +50,7 @@ test('profile parts preserve V1 bytes while exposing independently deduplicable 
 })
 
 test('minimal reference has no fixed explanatory prose and retains exact suffix stripping', () => {
-  const reference = buildTurnReferenceContent({ userId: '42', messageId: 'm', allowedTools: [], declaredTools: [], references: {}, taskStatuses: [] })
+  const reference = buildTurnReferenceContent({ userId: '42', messageId: 'm', allowedTools: [], declaredTools: [], references: {} })
   assert.equal(reference, TURN_REFERENCE_START + '{"currentUserQQ":"42","targetMessageId":"m","allowedTools":[],"newObserverCount":0}' + TURN_REFERENCE_END)
   const body = `quoted ${TURN_REFERENCE_START} literal ${TURN_REFERENCE_END}`
   assert.equal(stripTurnReferenceContent(body + reference, reference), body)

@@ -3,7 +3,8 @@
 // 同一条用户消息触发的多个工具（无论一轮并行还是多轮串行）聚合成一条 record。
 // 内存 Map + redis 双层缓存，与 taskStatus 同构。
 // 以 mixin 形式挂到插件原型上，this 指向插件实例（依赖 this.config）。
-// 成败判定用 hasExplicitErrorMarker（严格版，零误判），不用带中文模糊匹配的 isToolResultError。
+// 写侧用 hasExplicitErrorMarker(..., {chinese:false}) 保留 V1 判据；
+// V2 投影另用默认中文失败前缀识别，不修改共享存储。
 
 import { hasExplicitErrorMarker } from "./toolResult.js"
 import { replayToolResults } from './replayCoverage.js'
@@ -21,8 +22,18 @@ function truncateResult(text, max) {
   return s.length > max ? s.slice(0, max) + "...(已截断)" : s
 }
 
-export function toolHistoryFacts(records, snapshot, budget = 512) {
-  const receipts = replayToolResults(snapshot.blocks)
+export function toolHistoryFacts(records, snapshot, budget = 512, receipts = replayToolResults(snapshot.blocks)) {
+  // Smart reruns can leave multiple records for one message because writes
+  // merge only into the head. Select the newest without changing V1 storage or
+  // the existing history:{messageId}:{index} identity. ID-less records stay apart.
+  const newest = new Map()
+  const timeOf = record => Number.isFinite(Number(record.time)) ? Number(record.time) : 0
+  records.forEach((record, index) => {
+    const key = record.messageId == null || String(record.messageId) === '' ? `record:${index}` : `message:${record.messageId}`
+    const previous = newest.get(key)
+    if (!previous || timeOf(record) > timeOf(previous)) newest.set(key, record)
+  })
+  records = [...newest.values()]
   const consumed = new Set()
   const pending = []
   for (const record of records) for (const [index, tool] of (record.tools || []).entries()) {

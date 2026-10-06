@@ -23,7 +23,7 @@ function setup(responses, { msg = 'hello', rounds = 5, terminal = false, require
   const requests = []
   const controls = buildAgentControls({ e, tools, allowedTools: tools.map(tool => tool.function.name), requiredTools, config, botId: 'bot' })
   const header = buildAgentPromptCacheHeaders({ systemContent: 'persona', botUin: 'bot', groupContext: { groupId: 'group' } }, tools, 'test', config)
-  const referenceContent = buildTurnReferenceContent({ turnId: 'turn', userId: '42', references: { memory: 'full current memory' }, taskStatuses: [], allowedTools: controls.allowedTools, agentControls: controls })
+  const referenceContent = buildTurnReferenceContent({ userId: '42', references: { memory: 'full current memory' }, allowedTools: controls.allowedTools, agentControls: controls })
   const turn = new CacheTurn({ turnId: 'turn', scope: { groupId: 'group' }, snapshot: { header, blocks: [] }, observers: [],
     userRow: { role: 'user', content: msg + referenceContent }, referenceContent, settings: promptCacheSettings(config), represented: [], messageId: 'source', agentControls: controls })
   turn.apiConfig = config

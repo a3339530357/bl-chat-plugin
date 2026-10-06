@@ -67,6 +67,6 @@ test('agent schema overrides clone only, retain parameter definitions, and do no
   assert.ok(!header.tools.find(tool => tool.function.name === 'voiceTool').function.description.includes('想用就用'))
   assert.deepEqual(header.tools[0].function.parameters, tools[0].function.parameters)
   assert.ok(Object.isFrozen(header.tools[0].function))
-  const reference = buildTurnReferenceContent({ turnId: 'one', userId: '42', references: {}, taskStatuses: [], allowedTools: ['googleImageEditTool'], agentControls: controls('编辑头像', { requiredTools: ['googleImageEditTool'] }) })
+  const reference = buildTurnReferenceContent({ userId: '42', references: {}, allowedTools: ['googleImageEditTool'], agentControls: controls('编辑头像', { requiredTools: ['googleImageEditTool'] }) })
   assert.ok(reference.includes('requiredTools'))
 })

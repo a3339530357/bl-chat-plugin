@@ -5,6 +5,7 @@ import { planContextNotes } from '../core/contextNotes.js'
 import { toolHistoryFacts, toolHistoryMethods } from '../core/toolHistory.js'
 import { hasExplicitErrorMarker, isToolResultError } from '../core/toolResult.js'
 import { tokenEstimate } from '../core/promptCache.js'
+import { replayToolResults } from '../core/replayCoverage.js'
 
 const toolBlock = (name, outcome) => ({ replayVersion: 3, mode: 'agent', messageIds: ['m1'], taskOutcomes: outcome ? [outcome] : [], apiRows: [
   { role: 'user', content: 'request' },
@@ -89,4 +90,39 @@ test('Chinese failure fix applies to V2 projection while legacy stored flags/cla
     assert.match(facts[0].text, /failed/)
     assert.equal(records[0].tools[0].result, text)
   } finally { globalThis.redis = previousRedis }
+})
+
+test('duplicate message histories choose the newest time without flipping facts across turns', () => {
+  const old = { messageId: 'same', time: 100, tools: [{ toolName: 'probe', result: 'old result' }, { toolName: 'other', result: 'stale extra tool' }] }
+  const latest = { messageId: 'same', time: 200, tools: [{ toolName: 'probe', result: 'latest result' }] }
+  const records = [old, latest]
+  const snapshot = { blocks: [], noteState: {}, noteClock: 1 }
+  let facts = toolHistoryFacts(records, snapshot)
+  assert.equal(facts.length, 1)
+  assert.equal(facts[0].key, 'history:same:0')
+  assert.equal(facts[0].value.result, 'latest result')
+  const plan = planContextNotes(snapshot, facts)
+  snapshot.blocks = plan.notes.map(note => note.block)
+  snapshot.noteState = Object.fromEntries(plan.notes.map(note => [note.entry.key, note.entry]))
+  for (let round = 0; round < 3; round++) {
+    snapshot.noteClock++
+    facts = toolHistoryFacts(round % 2 ? records : [...records].reverse(), snapshot)
+    assert.equal(facts.length, 1)
+    assert.deepEqual(planContextNotes(snapshot, facts).notes, [])
+  }
+  assert.equal(records[0], old)
+  assert.equal(records[1], latest)
+  assert.equal(toolHistoryFacts([
+    { time: 10, tools: [{ toolName: 'probe', result: 'one' }] },
+    { time: 20, tools: [{ toolName: 'probe', result: 'two' }] }
+  ], { blocks: [], noteState: {}, noteClock: 1 }).length, 2)
+})
+
+test('task and history projection accept the same receipts without rescanning replay blocks', async () => {
+  const status = { messageId: 'm1', toolName: 'probe', status: 'tool_success', error: '', updatedAt: 100, toolCallId: 'c1' }
+  const receipts = replayToolResults([toolBlock('probe', status)])
+  const snapshot = { noteState: {}, noteClock: 1, get blocks() { throw new Error('unexpected replay scan') } }
+  const owner = { getTaskStatus: async () => status }
+  assert.deepEqual(await taskStatusMethods.getTaskStatusFacts.call(owner, 'group', ['m1'], 'current', snapshot, receipts), [])
+  assert.deepEqual(toolHistoryFacts([{ messageId: 'm1', tools: [{ toolName: 'probe', result: 'done' }] }], snapshot, 512, receipts), [])
 })

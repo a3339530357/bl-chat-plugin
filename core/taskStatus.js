@@ -22,8 +22,7 @@ function setTaskStatusCache(key, record) {
 }
 
 export const taskStatusMethods = {
-  async getTaskStatusFacts(groupId, messageIds, currentMessageId, snapshot) {
-    const results = replayToolResults(snapshot.blocks)
+  async getTaskStatusFacts(groupId, messageIds, currentMessageId, snapshot, results = replayToolResults(snapshot.blocks)) {
     const ids = [...new Set(messageIds.filter(id => id != null && String(id) !== String(currentMessageId)).map(String))]
     const facts = await Promise.all(ids.map(async id => {
       const status = await this.getTaskStatus(groupId, id)
@@ -41,16 +40,6 @@ export const taskStatusMethods = {
       return { key, value, text: `任务 消息${id} ${value.tool || '-'}=${state}${value.error ? ` 原因=${JSON.stringify(value.error)}` : ''}` }
     }))
     return facts.filter(Boolean)
-  },
-
-  async getTaskStatusPromptSnapshot(groupId, messageIds, currentMessageId) {
-    const ids = [...new Set(messageIds.filter(id => id !== undefined && id !== null && String(id) !== String(currentMessageId)).map(String))]
-    const states = await Promise.all(ids.map(async id => {
-      const status = await this.getTaskStatus(groupId, id)
-      const text = this.formatTaskStatusForPrompt(status)
-      return text ? `[消息ID:${id}] ${text}` : null
-    }))
-    return states.filter(Boolean)
   },
 
   getTaskStatusCacheKey(groupId, messageId) {

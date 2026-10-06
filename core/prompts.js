@@ -157,13 +157,13 @@ export const TURN_REFERENCE_START = '\n\n<!-- bl-chat-plugin:turn-reference:star
 export const TURN_REFERENCE_END = '\n<!-- bl-chat-plugin:turn-reference:end -->'
 const REFERENCE_FOOTER = '未列出的消息当前没有进行中的任务，不能沿用旧轮 processing/tool_running 状态，也不能把已消费的历史消息当作新任务重复执行。'
 
-export function buildTurnReferenceContent({ userId, messageId, references, taskStatuses, allowedTools, declaredTools, newObserverCount = 0, agentControls }) {
+export function buildTurnReferenceContent({ userId, messageId, references, allowedTools, declaredTools, newObserverCount = 0, agentControls }) {
   const allowed = new Set(allowedTools || [])
   const declared = new Set((declaredTools || []).map(tool => typeof tool === 'string' ? tool : tool.function.name))
   const permission = allowed.size && declared.size === allowed.size && [...declared].every(name => allowed.has(name)) ? 'all' : [...allowed]
   const metadata = JSON.stringify({ currentUserQQ: String(userId), targetMessageId: messageId ?? null, allowedTools: permission, newObserverCount,
     ...(agentControls ? { requiredTools: agentControls.requiredTools, actionPolicy: agentControls.policy, autonomousToolLimit: 1 } : {}) })
-  const changes = [...Object.values(references || {}).filter(Boolean), ...(taskStatuses || [])]
+  const changes = Object.values(references || {}).filter(Boolean)
   return `${TURN_REFERENCE_START}${metadata}${changes.length ? '\n' + changes.join('\n') : ''}${TURN_REFERENCE_END}`
 }
 

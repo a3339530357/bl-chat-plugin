@@ -13,6 +13,7 @@ import { replayRows } from './replayAdapters.js'
 import { participantFacts, planContextNotes, referenceFacts, profileFacts } from './contextNotes.js'
 import { toolHistoryFacts } from './toolHistory.js'
 import { dumpTurnTail } from './tailDump.js'
+import { replayToolResults } from './replayCoverage.js'
 
 const _path = process.cwd()
 
@@ -26,10 +27,9 @@ export const sessionHistoryMethods = {
       contextStore: store, scope, journalContent: userContent
     })
     const origin = originKeyForEvent(e)
-    const asOf = new Date().toISOString()
     const preliminary = buildTurnReferenceContent({
-      turnId: session.turnId, userId: e.user_id, messageId: e.message_id, asOf,
-      references: { time: references['北京时间'] || references.time }, taskStatuses: [], allowedTools, agentControls, declaredTools: header.tools
+      userId: e.user_id, messageId: e.message_id,
+      references: { time: references['北京时间'] || references.time }, allowedTools, agentControls, declaredTools: header.tools
     })
     const agent = header.mode === 'agent'
     const incomingTokens = (agent ? tokenEstimate(header.agentSystem) + tokenEstimate(header.tools) :
@@ -63,16 +63,16 @@ export const sessionHistoryMethods = {
       ...snapshot.blocks.flatMap(block => block.messageIds || []),
       ...snapshot.events.map(event => event.message?.message_id)
     ].filter(id => id !== undefined && id !== null && String(id) !== String(e.message_id)).map(String))]
-    const taskFacts = await taskStatusMethods.getTaskStatusFacts.call(this, scope.groupId, messageIds, e.message_id, snapshot)
+    const receipts = replayToolResults(snapshot.blocks)
+    const taskFacts = await taskStatusMethods.getTaskStatusFacts.call(this, scope.groupId, messageIds, e.message_id, snapshot, receipts)
     const history = this.isToolHistoryEnabled?.() !== false && this.loadToolHistory ? await this.loadToolHistory(scope.groupId) : []
-    const historyFacts = toolHistoryFacts(history, snapshot, settings.toolHistoryTokens)
+    const historyFacts = toolHistoryFacts(history, snapshot, settings.toolHistoryTokens, receipts)
     const taskKeys = new Set(messageIds.map(id => `task:${id}`))
     const retiredTasks = Object.keys(snapshot.noteState).filter(key => key.startsWith('task:') && !taskKeys.has(key))
       .map(key => ({ key, value: null, text: '', retired: true }))
     const notePlan = planContextNotes(snapshot, [...participantFacts(snapshot, participants, e), ...taskFacts, ...historyFacts, ...retiredTasks,
       ...referenceFacts(snapshot, references, e.user_id), ...profileFacts(snapshot, profileMessages, e.user_id, e.message_id, userContent, observers)])
     references = { time: references['北京时间'] || references.time, updates: notePlan.content }
-    const taskStatuses = []
     const selected = this.filterChatByQQ([
       ...observers.flatMap(observer => replayRows(observer.block, agent ? 'agent' : 'tools')), { role: 'user', content: userContent }
     ], e.user_id)
@@ -83,12 +83,13 @@ export const sessionHistoryMethods = {
       })
     }
     const referenceContent = buildTurnReferenceContent({
-      turnId: session.turnId, userId: e.user_id, messageId: e.message_id, asOf,
-      references, taskStatuses, allowedTools, newObserverCount, agentControls, declaredTools: snapshot.header.tools
+      userId: e.user_id, messageId: e.message_id,
+      references, allowedTools, newObserverCount, agentControls, declaredTools: snapshot.header.tools
     })
     const turn = new CacheTurn({
       turnId: session.turnId, scope, snapshot, observers, represented, settings, messageId: e.message_id,
-      userRow: { role: 'user', content: userContent + referenceContent }, referenceContent, agentControls, notes: notePlan.notes
+      userRow: { role: 'user', content: userContent + referenceContent }, referenceContent, agentControls,
+      notes: notePlan.notes, unchangedNotes: notePlan.unchangedNotes
     })
     const requestTokens = agent ? tokenEstimate(turn.agentBase) + tokenEstimate(snapshot.header.tools) :
       Math.max(tokenEstimate(turn.toolBase) + tokenEstimate(snapshot.header.tools), tokenEstimate(turn.chatBase))
@@ -114,7 +115,7 @@ export const sessionHistoryMethods = {
     const store = this.contextStore || contextStore
     const payload = {
       turnId: turn.turnId, readUntil: turn.snapshot.readUntil, baseCursor: turn.snapshot.cursor,
-      observers: turn.observers, represented, block: turn.block(), notes: turn.notes
+      observers: turn.observers, represented, block: turn.block(), notes: turn.notes, unchangedNotes: turn.unchangedNotes
     }
     for (let attempt = 0; attempt < 2; attempt++) {
       try {

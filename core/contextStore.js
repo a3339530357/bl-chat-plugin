@@ -142,7 +142,7 @@ local hasMembers = false
 for key, _ in pairs(cjson.decode(noteState)) do if string.sub(key, 1, 7) == 'member:' then hasMembers = true; break end end
 local identityEvents = {}
 if not hasMembers then
-  for _, encoded in ipairs(redis.call('ZRANGE', KEYS[3], 0, -1)) do
+  for _, encoded in ipairs(redis.call('ZRANGE', KEYS[3], -2000, -1)) do
     local event = cjson.decode(encoded)
     local payload = cjson.decode(event.payload)
     table.insert(identityEvents, {seq=event.seq, message={sender=payload.message and payload.message.sender}})
@@ -167,6 +167,19 @@ local replayCount = redis.call('LLEN', KEYS[6])
 local referencesClean = tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1') == replayCount
 local budgetsKnown = tonumber(redis.call('HGET', KEYS[5], 'agentBudgetCount') or '-1') == replayCount
 local state = cjson.decode(redis.call('HGET', KEYS[5], 'contextNoteState') or '{}')
+local acknowledgments = cjson.decode(ARGV[11] or '[]')
+local conflicts = {}
+for _, ack in ipairs(acknowledgments) do
+  local previous = state[ack[1]] and cjson.decode(state[ack[1]])
+  if not previous or (previous.version <= ack[3] and previous.version ~= ack[2]) then table.insert(conflicts, ack[1]) end
+end
+-- An unchanged value may have raced an earlier turn's change. Ask the caller
+-- to materialize only those conflicted entries before any state is written.
+if #conflicts > 0 then return cjson.encode({noteConflicts=conflicts}) end
+for _, ack in ipairs(acknowledgments) do
+  local previous = cjson.decode(state[ack[1]])
+  if previous.version < ack[3] then previous.version = ack[3]; state[ack[1]] = cjson.encode(previous) end
+end
 local visible = {}
 local notes = cjson.decode(ARGV[10] or '[]')
 if #notes > 0 then
@@ -339,8 +352,11 @@ export class ContextStore {
     const compact = deltaNotes.length >= (settings.noteCompactChanges || 32) ||
       deltaNotes.reduce((sum, block) => sum + block.tokens, 0) >= (settings.noteCompactTokens || 2048)
     if (compact && notes.length > 1 && compactAttempt < 3) {
-      const baseline = contextNoteBlock(Object.values(result.noteState).filter(entry => !entry.retired).sort((a, b) => a.key.localeCompare(b.key)), { baseline: true })
-      const after = [JSON.stringify(baseline), ...encodedBlocks.filter((_, index) => !result.blocks[index].contextNotes)]
+      const baseline = contextNoteBlock(Object.values(result.noteState).filter(entry => !entry.retired && entry.valueJson !== 'null').sort((a, b) => a.key.localeCompare(b.key)), { baseline: true })
+      // A baseline must be trimmed last, after old conversation blocks. Putting
+      // it at index zero causes capacity -> restore -> recompress oscillation.
+      // Readers arbitrate facts by version, so physical position is immaterial.
+      const after = [...encodedBlocks.filter((_, index) => !result.blocks[index].contextNotes), JSON.stringify(baseline)]
       const compressed = await this.evaluate(COMPACT_NOTES, this.keys(scope).slice(0, 7),
         [...this.args(scope), JSON.stringify(encodedBlocks), JSON.stringify(after), encodedState])
       const refreshed = await this.read(scope, header, settings, incomingTokens, currentOrigin, compactAttempt + 1)
@@ -385,16 +401,29 @@ export class ContextStore {
     throw new ContextStoreError('reference_migration_conflict')
   }
 
-  async commit(scope, { turnId, readUntil, baseCursor, observers, block, represented = [], notes = [] }) {
+  async commit(scope, { turnId, readUntil, baseCursor, observers, block, represented = [], notes = [], unchangedNotes = [] }) {
     nativeReplayRows(block)
     observers.forEach(observer => nativeReplayRows(observer.block))
     notes.forEach(note => nativeReplayRows(note.block))
-    return this.evaluate(COMMIT, this.keys(scope), [
-      ...this.args(scope), turnId, readUntil,
+    const candidates = [...notes]
+    let pending = [...unchangedNotes]
+    const prefix = [...this.args(scope), turnId, readUntil,
       JSON.stringify(observers.map(observer => ({ eventId: observer.eventId, blockJson: JSON.stringify(observer.block) }))),
-      JSON.stringify(block), JSON.stringify(represented), baseCursor,
-      JSON.stringify(notes.map(note => ({ eventId: note.eventId, entryJson: JSON.stringify(note.entry), blockJson: JSON.stringify(note.block) })))
-    ])
+      JSON.stringify(block), JSON.stringify(represented), baseCursor]
+    for (;;) {
+      const result = await this.evaluate(COMMIT, this.keys(scope), [...prefix,
+        JSON.stringify(candidates.map(note => ({ eventId: note.eventId, entryJson: JSON.stringify(note.entry), blockJson: JSON.stringify(note.block) }))),
+        JSON.stringify(pending.map(note => [note.entry.key, note.baseVersion, note.entry.version]))
+      ])
+      if (!result.noteConflicts?.length) return result
+      const conflicts = new Set(result.noteConflicts)
+      for (const { entry } of pending.filter(note => conflicts.has(note.entry.key))) candidates.push({
+        eventId: `note:${entry.version}:${entry.key}`, entry, block: contextNoteBlock([entry])
+      })
+      // Every retry removes at least one acknowledgment, so progress is bounded
+      // by the captured facts even under concurrent commits.
+      pending = pending.filter(note => !conflicts.has(note.entry.key))
+    }
   }
 
   async exportSnapshot(scope) {

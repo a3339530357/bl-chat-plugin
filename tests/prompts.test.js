@@ -62,8 +62,8 @@ test("buildChatSystemPrompt：以群聊消息记录段结尾", () => {
 })
 
 const referenceOptions = {
-  turnId: 'turn-one', userId: '42', messageId: 'message-one', asOf: '2026-10-03T12:00:00.000Z',
-  references: { time: 'current time', memory: 'current memory' }, taskStatuses: ['current processing'], allowedTools: ['probe']
+  userId: '42', messageId: 'message-one',
+  references: { time: 'current time', memory: 'current memory', tasks: 'current processing' }, allowedTools: ['probe']
 }
 
 test('turn reference anchors delimit all current data and strip exactly the generated suffix', () => {
@@ -80,14 +80,14 @@ test('turn reference anchors delimit all current data and strip exactly the gene
 })
 
 test('reference stripping preserves literal anchors in user input and nested markers in RAG', () => {
-  const quoted = buildTurnReferenceContent({ ...referenceOptions, turnId: 'quoted' })
+  const quoted = buildTurnReferenceContent({ ...referenceOptions, references: { memory: 'quoted memory' } })
   const body = `literal ${TURN_REFERENCE_START} text ${TURN_REFERENCE_END}\n${quoted}`
   const reference = buildTurnReferenceContent({ ...referenceOptions, references: { memory: `data ${TURN_REFERENCE_START} inner ${TURN_REFERENCE_END}` } })
   assert.equal(stripTurnReferenceContent(body + reference, reference), body)
 })
 
 test('legacy cleanup requires matching turn/message metadata and complete generated footer', () => {
-  const legacy = legacyReferenceContent(referenceOptions)
+  const legacy = legacyReferenceContent({ ...referenceOptions, turnId: 'turn-one', asOf: '2026-10-03T12:00:00.000Z' })
   const body = 'a pasted 【本轮参考资料】 title stays in user text'
   const row = { role: 'user', content: body + legacy }
   const reply = { role: 'assistant', content: 'reply', reasoning_content: 'retained reasoning' }

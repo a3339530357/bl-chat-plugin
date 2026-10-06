@@ -18,7 +18,7 @@ export function bindCacheRequest(request, turn) {
 export function cacheRequestContext(request) { return requestContexts.get(request) }
 
 export class CacheTurn {
-  constructor({ turnId, scope, snapshot, observers, userRow, referenceContent, represented, settings, messageId, agentControls, notes = [] }) {
+  constructor({ turnId, scope, snapshot, observers, userRow, referenceContent, represented, settings, messageId, agentControls, notes = [], unchangedNotes = [] }) {
     this.turnId = turnId
     this.scope = scope
     this.snapshot = snapshot
@@ -29,6 +29,7 @@ export class CacheTurn {
     this.observers = observers
     this.represented = represented
     this.notes = freezeWire(wireClone(notes))
+    this.unchangedNotes = freezeWire(unchangedNotes.map(note => ({ ...note, entry: { ...note.entry } })))
     this.userRow = freezeWire(wireClone(userRow))
     this.historyUserRow = freezeWire(wireClone({
       ...userRow, content: stripTurnReferenceContent(userRow.content, referenceContent)

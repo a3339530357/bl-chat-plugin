@@ -168,7 +168,7 @@ test('six turns keep one transient reference wrapper and compact changing data w
       for (const row of [...replayRows(block, 'tools'), ...replayRows(block, 'chat')]) assert.equal(row.content?.includes(TURN_REFERENCE_START), false)
     }
     previousHistory = snapshot.blocks.flatMap(block => replayRows(block, 'tools'))
-    assert.equal(snapshot.blocks.at(-1).toolRows[0].content, content)
+    assert.equal(snapshot.blocks.filter(block => !block.contextNotes).at(-1).toolRows[0].content, content)
     assert.ok(snapshot.blocks.filter(block => block.contextNotes).length <= 4)
   }
 })

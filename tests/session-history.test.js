@@ -184,7 +184,7 @@ test('legacy references migrate before budget trimming without losing tool rows,
   await store.record(scope, event('old'))
   const legacy = legacyReferenceContent({
     turnId: 'old', userId: 'user', messageId: 'old', asOf: '2026-10-03T12:00:00.000Z',
-    references: { memory: 'obsolete memory '.repeat(4000) }, taskStatuses: [], allowedTools: ['probe']
+    references: { memory: 'obsolete memory '.repeat(4000) }, allowedTools: ['probe']
   })
   const user = { role: 'user', content: 'full original user body\nimage URL' + legacy }
   const call = { role: 'assistant', tool_calls: [{ id: 'original-call', type: 'function', function: { name: 'probe', arguments: ' { "x" : 1 } ' } }] }
