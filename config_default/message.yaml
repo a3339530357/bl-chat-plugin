@@ -312,6 +312,7 @@ pluginSettings:
     rateLimitMaxPerWindow: 3
   openai_tool_choice: auto
   oneapi_tools:
+    - grabRedBagTool                     # 抢红包专用；启用列表需包含它，与强制注入的声明集一致，否则 allowedTools:"all" 判定永远差一员
     - likeTool
     - pokeTool
     - googleImageAnalysisTool
