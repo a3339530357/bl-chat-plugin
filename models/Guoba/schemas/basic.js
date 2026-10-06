@@ -60,6 +60,11 @@ export default [
     { label: '保留原来的自主动作规则', value: 'legacy' },
     { label: '什么都不自作主张，全部要明确要求', value: 'explicit' }
   ] } },
+  { field: 'promptCache.agentToolPolicies.voiceTool.category', label: '发语音的自主度', component: 'Select', componentProps: { options: [
+    { label: '要明确说「发语音」才发（默认）', value: 'effect' },
+    { label: '觉得有趣就能自己发（每轮最多一次）', value: 'light' }
+  ] }, bottomHelpMessage: '选"light"后哈基米聊天觉得合适就会主动发语音，不用你开口' },
+  { field: 'promptCache.tailDump', label: '附加资料存档（排查用）', component: 'Switch', bottomHelpMessage: '把每轮附加参考资料存到服务器 /root/tmp/tail-dump-群号.json，看哈基米每轮实际带了多少额外内容。排查用，平时关' },
   { field: 'promptCache.preserveForcedSubsets', label: '强制指定工具（双阶段旧项）', component: 'Switch', bottomHelpMessage: '旧的双阶段模式才用；一次搞定模式下无效' },
   { field: 'promptCache.preserveFinalNoTools', label: '末轮不带工具（双阶段旧项）', component: 'Switch', bottomHelpMessage: '旧的双阶段模式才用；一次搞定模式下无效' },
   {
