@@ -247,7 +247,8 @@ export class MessageManager {
         let urlPart = '';
         switch (msg.type) {
           case 'text':
-            action = `在${isGroup ? '群里' : '私聊'}说: ${msg.text}`;
+            // 直接存裸文本——旧的「在群里说: 」包装会随 #查看群聊记录 原样转发出去，满屏重复
+            action = String(msg.text ?? '');
             break;
           case 'image': {
             const url = await this.getImageUrl([msg]);
