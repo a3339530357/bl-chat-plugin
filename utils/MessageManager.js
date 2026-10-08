@@ -428,7 +428,7 @@ export class MessageManager {
     const config = options.promptCacheConfig || this.promptCacheConfig;
     const store = options.contextStore || contextStore;
     const journalScope = isGroup && isPromptCacheEnabled(config, id)
-      ? options.scope || store.scope(botIdForEvent(e), id) : null;
+      ? options.scope || store.scope(botIdForEvent(e), id, { settings: promptCacheSettings(config) }) : null;
     // Attach a rejection handler immediately while an earlier write is queued.
     journalScope?.catch?.(() => {});
     const context = { isGroup, type, id, redisKey, journalScope, journalConfig: config, store };
@@ -463,7 +463,8 @@ export class MessageManager {
       const seed = await this.getMessages(type, id, { strict: true });
       for (const message of [...seed].reverse()) {
         const received = message.received_at ?? moment(message.time, 'YYYY-MM-DD HH:mm:ss').valueOf();
-        if (!Number.isFinite(received) || beijingDay(received).dayKey !== scope.dayKey) continue;
+        // 按天模式只补录当天消息；连续账本无日切概念，全量补（eventId 查重保证幂等）
+        if (!Number.isFinite(received) || (scope.continuous !== true && beijingDay(received).dayKey !== scope.dayKey)) continue;
         const origin = message.origin_key || (message.message_id !== undefined && message.message_id !== null
           ? `message:${scope.botId}:${id}:${message.message_id}` : `seed:${scope.resetId}:${message.time}:${message.sender?.user_id}:${seed.indexOf(message)}`);
         await store.record(scope, { eventId: origin, message }, promptCacheSettings(journalConfig));
@@ -549,7 +550,7 @@ export class MessageManager {
       if (type === 'group' && options.botId) {
         const previous = writeQueues.get(redisKey) || Promise.resolve();
         const task = previous.then(async () => {
-          await contextStore.reset(String(options.botId), id);
+          await contextStore.reset(String(options.botId), id, { settings: promptCacheSettings(this.promptCacheConfig) });
           await redis.del(redisKey);
         });
         writeQueues.set(redisKey, task.catch(() => {}));

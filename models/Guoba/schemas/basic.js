@@ -45,6 +45,10 @@ export default [
     bottomHelpMessage: '填群号（回车添加）；* 表示所有群',
     componentProps: { allowAdd: true, allowDel: true }
   },
+  {
+    field: 'promptCache.continuousHistory', label: '跨天连续对话', component: 'Switch',
+    bottomHelpMessage: '开启后 AI 的记忆不再每晚 0 点清空，昨天聊的今天还记得（记满记忆上限就从最早的开始忘）。关闭则每晚照旧清空重来'
+  },
   { field: 'promptCache.highWaterTokens', label: '记忆超过多少就删旧的', component: 'InputNumber', componentProps: { min: 4096, max: 524288 }, bottomHelpMessage: '聊天记录涨过这条线（token 计），就从最早的消息开始删，防止越聊越贵' },
   { field: 'promptCache.lowWaterTokens', label: '删到多少停手', component: 'InputNumber', componentProps: { min: 2048, max: 524288 }, bottomHelpMessage: '删旧消息删到这条线就停，保留近期聊天' },
   { field: 'promptCache.reserveTokens', label: '给回复留的余量', component: 'InputNumber', componentProps: { min: 1024, max: 65536 }, bottomHelpMessage: '算记忆上限时，给 AI 的回复和工具结果预留的空间，一般不用动' },

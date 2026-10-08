@@ -10,7 +10,7 @@ import { randomUUID } from "crypto"
 import schedule from 'node-schedule'
 import { parseToolConfigEntry, buildAgentControls, hasAgentToolIntent, agentToolDenied } from "../core/toolConfig.js"
 import { buildChatSystemPrompt, buildPromptCacheHeaders, buildAgentPromptCacheHeaders } from "../core/prompts.js"
-import { isPromptCacheEnabled, promptCacheMode, agentConfigurationError, botIdForEvent, wireClone, freezeWire, replayEventRow, cacheDiagnostic } from '../core/promptCache.js'
+import { isPromptCacheEnabled, promptCacheMode, agentConfigurationError, botIdForEvent, wireClone, freezeWire, replayEventRow, cacheDiagnostic, promptCacheSettings } from '../core/promptCache.js'
 import { contextStore } from '../core/contextStore.js'
 import { bindCacheRequest } from '../core/cacheTurn.js'
 import { getV2MessageManager } from '../utils/MessageManager.js'
@@ -531,7 +531,7 @@ export class ChatPlugin extends plugin {
       const cacheMode = promptCacheMode(this.config, groupId)
       const cacheConfig = useCacheV2 ? wireClone(this.config) : null
       const cacheStore = this.contextStore || contextStore
-      const cacheScope = useCacheV2 ? cacheStore.scope(botIdForEvent(e), groupId) : null
+      const cacheScope = useCacheV2 ? cacheStore.scope(botIdForEvent(e), groupId, { settings: promptCacheSettings(this.config) }) : null
       cacheScope?.catch(() => {})
 
       // smart 模式下记录本轮默认只覆盖到自身事件；读取群历史快照后会提升到当时的
@@ -789,7 +789,7 @@ export class ChatPlugin extends plugin {
           const v1Participants = formatParticipants(extractParticipants(v1Source, botIdForEvent(e), Bot.nickname))
           groupUserMessages = groupUserMessages.filter(m => m.role !== "system")
           groupUserMessages.unshift({ role: "system", content: systemContent + (v1Participants ? `
-【今日在场成员】
+【在场成员】
 发言人身份与QQ号（按昵称查询）：
 ${v1Participants}` : '') })
           groupUserMessages.push({ role: "user", content: userContent })

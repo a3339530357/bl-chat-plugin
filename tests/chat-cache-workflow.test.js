@@ -5,7 +5,7 @@ import http from 'node:http'
 import { once } from 'node:events'
 import { redisFixture } from './helpers/redis-fixture.js'
 import { contextStore, ContextStore } from '../core/contextStore.js'
-import { wireClone, originKeyForEvent, tokenEstimate } from '../core/promptCache.js'
+import { wireClone, originKeyForEvent, tokenEstimate, promptCacheSettings } from '../core/promptCache.js'
 import { TURN_REFERENCE_START } from '../core/prompts.js'
 
 register('./helpers/yunzai-cache-loader.mjs', import.meta.url)
@@ -399,7 +399,7 @@ test('reenabling V2 backfills same-day messages collected by V1 without duplicat
   await legacy.recordMessage(make('while-off'))
   getV2MessageManager(config)
   await manager.recordMessage(make('after-on'), { messageMaxLength: 200 })
-  const scope = await contextStore.scope('bot', 'resume')
+  const scope = await contextStore.scope('bot', 'resume', { settings: promptCacheSettings(config) })
   assert.equal((await contextStore.lookup(scope, originKeyForEvent(make('before-off')))).seq, 1)
   assert.equal((await contextStore.lookup(scope, originKeyForEvent(make('while-off')))).seq, 2)
   assert.equal((await contextStore.lookup(scope, originKeyForEvent(make('after-on')))).seq, 3)

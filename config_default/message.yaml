@@ -15,6 +15,8 @@ pluginSettings:
   promptCache:
     enabled: false
     groups: []
+    # 跨天连续对话：true=记忆不按天清空，昨天聊的今天还记得（滚动3天无活动才整体过期，记忆上限内从最早开始裁）；false=每晚0点清空
+    continuousHistory: true
     singleStage: false
     singleStageGroups: []
     agentTemperature: 0.85

@@ -71,7 +71,7 @@ export function formatReplayEventRow(event, botId) {
   const sender = message.sender || {}
   if (String(message.content || '').startsWith('【系统提示】')) return null
   const role = String(sender.user_id) === String(botId) ? 'assistant' : 'user'
-  // 渲染 v3 包装：`[HH:MM] 昵称[ID:x]: 内容`——QQ 号与群身份统一进尾部【今日在场成员】表，
+  // 渲染 v3 包装：`[HH:MM] 昵称[ID:x]: 内容`——QQ 号与群身份统一进尾部【在场成员】表，
   // 不逐行重复；bot 行 `[昵称][ID:x]: 内容`（ID 保留——「撤回你刚才那句」靠它定位）
   let content = role === 'assistant'
     ? `[${sender.nickname || 'Bot'}]${message.message_id ? `[ID:${message.message_id}]` : ''}: ${message.content || ''}`

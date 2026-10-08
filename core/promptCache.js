@@ -39,7 +39,8 @@ export function promptCacheSettings(config = {}) {
     noteCompactTokens: Math.max(256, finiteSetting(value.noteCompactTokens, 2048)),
     toolHistoryTokens: Math.max(64, finiteSetting(value.toolHistoryTokens, 512)),
     preserveForcedSubsets: value.preserveForcedSubsets !== false,
-    preserveFinalNoTools: value.preserveFinalNoTools !== false
+    preserveFinalNoTools: value.preserveFinalNoTools !== false,
+    continuousHistory: value.continuousHistory !== false
   }
 }
 
@@ -82,6 +83,13 @@ export function beijingDay(now = Date.now()) {
   const dayKey = date.toISOString().slice(0, 10).replaceAll('-', '')
   const deadline = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1) - 8 * 3600000
   return { dayKey, deadline, expiresAt: Math.floor(deadline / 1000) + 2 * 86400 }
+}
+
+// 连续账本：不按天分键，改为自本次操作起 3 天的滚动过期窗口（每次读写都会续期）。
+// 群连续 3 天无任何消息/对话，账本才整体过期清空。
+export function rollingScope(now = Date.now()) {
+  const deadline = now + 3 * 86400 * 1000
+  return { dayKey: 'cont', deadline, expiresAt: Math.floor(deadline / 1000) }
 }
 
 export function botIdForEvent(e = {}) {

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { beijingDay, tokenEstimate, replayEventRow } from './promptCache.js'
+import { beijingDay, rollingScope, tokenEstimate, replayEventRow } from './promptCache.js'
 import { stripHistoricalTurnReferences } from './prompts.js'
 import { ContextStoreError, nativeReplayRows, replayFormat, replayRows, REPLAY_RENDERER_VERSION } from './replayAdapters.js'
 import { contextNoteBlock } from './contextNotes.js'
@@ -214,6 +214,16 @@ redis.call('RPUSH', KEYS[6], ARGV[7])
 local represented = cjson.decode(ARGV[8])
 for _, id in ipairs(represented) do redis.call('HSET', KEYS[7], id, '1') end
 redis.call('HSET', KEYS[5], 'cursor', math.max(cursor, untilSeq))
+-- 连续账本不再按天清库：消化完毕（seq<=cursor）的原始事件就地回收，防止 raw 无限增长。
+-- event_index 保留不动——查重（重启后 seed 补录幂等）与 eventIndexCount==HLEN 校验都依赖它。
+local newCursor = math.max(cursor, untilSeq)
+local stale = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', newCursor)
+if #stale > 0 then
+  local freed = 0
+  for _, encoded in ipairs(stale) do freed = freed + string.len(encoded) end
+  redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', newCursor)
+  redis.call('HINCRBY', KEYS[5], 'rawBytes', -freed)
+end
 redis.call('HSET', KEYS[5], 'replayCount', redis.call('LLEN', KEYS[6]), 'representedCount', redis.call('HLEN', KEYS[7]))
 if referencesClean and turn.referenceVersion == 2 then redis.call('HSET', KEYS[5], 'referenceCleanCount', redis.call('LLEN', KEYS[6])) end
 if budgetsKnown and turn.mode == 'agent' then redis.call('HSET', KEYS[5], 'agentBudgetCount', redis.call('LLEN', KEYS[6])) end
@@ -296,11 +306,13 @@ export class ContextStore {
     return result
   }
 
-  async scope(botId, groupId, now = Date.now()) {
-    const day = beijingDay(now)
-    const root = `${this.prefix}{${encodeURIComponent(botId)}:${encodeURIComponent(groupId)}:${day.dayKey}}:`
+  async scope(botId, groupId, { now = Date.now(), settings = null } = {}) {
+    const continuous = settings ? settings.continuousHistory === true : this.continuous === true
+    const day = continuous ? rollingScope(now) : beijingDay(now)
+    const dayPart = continuous ? '' : `:${day.dayKey}`
+    const root = `${this.prefix}{${encodeURIComponent(botId)}:${encodeURIComponent(groupId)}${dayPart}}:`
     const result = await this.evaluate(INITIALIZE, [`${root}active`], [randomUUID(), day.deadline, day.expiresAt])
-    return { ...day, root, resetId: result.resetId, botId: String(botId), groupId: String(groupId) }
+    return { ...day, continuous, root, resetId: result.resetId, botId: String(botId), groupId: String(groupId) }
   }
 
   keys(scope) {
@@ -438,9 +450,11 @@ export class ContextStore {
     return this.evaluate(REPLACE_REPLAY, this.keys(scope), [...this.args(scope), JSON.stringify({ before, after })])
   }
 
-  async reset(botId, groupId) {
-    const day = beijingDay()
-    const root = `${this.prefix}{${encodeURIComponent(botId)}:${encodeURIComponent(groupId)}:${day.dayKey}}:`
+  async reset(botId, groupId, { now = Date.now(), settings = null } = {}) {
+    const continuous = settings ? settings.continuousHistory === true : this.continuous === true
+    const day = continuous ? rollingScope(now) : beijingDay(now)
+    const dayPart = continuous ? '' : `:${day.dayKey}`
+    const root = `${this.prefix}{${encodeURIComponent(botId)}:${encodeURIComponent(groupId)}${dayPart}}:`
     return this.evaluate(RESET, [`${root}active`], [randomUUID(), day.deadline, day.expiresAt])
   }
 }
