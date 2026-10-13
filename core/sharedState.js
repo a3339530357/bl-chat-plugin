@@ -41,6 +41,7 @@ export function buildMemoryConfig(config) {
   const memorySystem = config.memorySystem || {}
   return {
     ...memorySystem,
+    automaticExtraction: false,
     memoryAiConfig: config.memoryAiConfig || null,
     embeddingAiConfig: config.embeddingAiConfig || null,
     pluginEnabled: config.enabled !== false,
@@ -69,6 +70,7 @@ export function initializeSharedState(config) {
     // 【不在此处、但有各自热更途径】emojiPackManager 每次选图前自行 refreshConfig；
     // qqMusicToken 由定时任务每 10 分钟重读；MCP 服务变更走 #mcp 重载（mcp-servers.yaml 不热更）。
     // 新增"子系统持有副本"型字段时必须同步扩展本分支，否则热更不生效（见 CLAUDE.md 工作约定）。
+    sharedState.messageManager.promptCacheConfig = config
     sharedState.messageManager.GROUP_MAX_MESSAGES = config.groupMaxMessages || 100
     sharedState.messageManager.CACHE_EXPIRE_DAYS = config.groupChatMemoryDays || 1
     Object.assign(sharedState.emotionManager.config, {
@@ -139,6 +141,7 @@ export function initializeSharedState(config) {
     sessionMap: new Map()
   }
 
+  sharedState.messageManager.promptCacheConfig = config
   applyToolRegistrySnapshot(sharedState)
   refreshLocalTools(sharedState, { force: true }).catch(error => {
     logger.error('[LocalToolRegistry] 初始化自定义工具失败:', error)

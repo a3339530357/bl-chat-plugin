@@ -254,6 +254,14 @@ pluginSettings:
       scolded: -0.15
       ignored: -0.05
       mentioned: 0.05
+  # 原料采集独立于 memorySystem/模型开关；groups 未设置时沿用 promptCache.groups。
+  # 未整理原料不设 TTL、不按容量裁剪；以下阈值只用于积压提醒。
+  memorySource:
+    enabled: true
+    remindMessages: 10000
+    remindBytes: 33554432
+    remindAgeHours: 168
+    reminderCooldownHours: 24
   memorySystem:
     enabled: false
     maxFactsPerUser: 100

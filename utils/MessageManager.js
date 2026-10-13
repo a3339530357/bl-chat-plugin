@@ -5,6 +5,7 @@ import { refreshTencentImageUrl } from './fileUtils.js';
 import { scanRedisKeys, deleteRedisKeys } from './redisScan.js';
 import { contextStore } from '../core/contextStore.js';
 import { botIdForEvent, originKeyForEvent, isPromptCacheEnabled, promptCacheSettings, wireClone, beijingDay } from '../core/promptCache.js';
+import { buildMemorySource, isMemorySourceEnabled, memoryScope } from './memory/sourceSchema.js';
 
 // 同 key 写队列（模块级：本类会被多处 new，含 Yunzai 每条消息实例化的插件，
 // 实例级锁跨实例不生效）。串行化 读-改-写，避免并发记录互相覆盖丢消息。
@@ -456,24 +457,29 @@ export class MessageManager {
     const { type, id, journalScope, journalConfig, store } = context;
     const scope = await journalScope;
     const eventId = originKeyForEvent(e);
+    const protectSource = isMemorySourceEnabled(journalConfig, id);
     const found = await store.lookup(scope, eventId);
     const syncKey = `${scope.root}r:${scope.resetId}`;
     this.syncedScopes ||= new Set();
     if (this.syncDay !== scope.dayKey) { this.syncedScopes.clear(); this.syncDay = scope.dayKey; }
     if (found.latest === 0 || !this.syncedScopes.has(syncKey)) {
       const seed = await this.getMessages(type, id, { strict: true });
+      if (protectSource) store.memorySources.scheduleHistory(scope, store, seed);
       for (const message of [...seed].reverse()) {
         const received = message.received_at ?? moment(message.time, 'YYYY-MM-DD HH:mm:ss').valueOf();
         // 按天模式只补录当天消息；连续账本无日切概念，全量补（eventId 查重保证幂等）
         if (!Number.isFinite(received) || (scope.continuous !== true && beijingDay(received).dayKey !== scope.dayKey)) continue;
         const origin = message.origin_key || (message.message_id !== undefined && message.message_id !== null
-          ? `message:${scope.botId}:${id}:${message.message_id}` : `seed:${scope.resetId}:${message.time}:${message.sender?.user_id}:${seed.indexOf(message)}`);
-        await store.record(scope, { eventId: origin, message }, promptCacheSettings(journalConfig));
+          ? `message:${scope.botId}:${id}:${message.message_id}` : protectSource
+            ? buildMemorySource(message, scope, { legacy: true }).eventId
+            : `seed:${scope.resetId}:${message.time}:${message.sender?.user_id}:${seed.indexOf(message)}`);
+        await store.record(scope, { eventId: origin, message }, promptCacheSettings(journalConfig),
+          protectSource ? buildMemorySource(message, scope, { eventId: origin, legacy: true }) : null);
       }
       this.syncedScopes.add(syncKey);
     }
     const known = options.journalOnly ? await store.lookup(scope, eventId) : found;
-    if (options.journalOnly && known.seq) return { source: { scope, seq: known.seq, eventId } };
+    if (options.journalOnly && known.seq && !protectSource) return { source: { scope, seq: known.seq, eventId } };
 
     // The current API user content is already resolved; this path must not fetch media again.
     const content = options.journalOnly ? options.journalContent ?? e.msg ?? e.raw_message ?? JSON.stringify(e.message || []) : undefined;
@@ -481,7 +487,9 @@ export class MessageManager {
     formatted.origin_key = eventId;
     formatted.received_at = Date.now();
     context.formatted = formatted;
-    const recorded = await store.record(scope, { eventId, message: wireClone(formatted) }, promptCacheSettings(journalConfig));
+    const recorded = await store.record(scope, { eventId, message: wireClone(formatted) }, promptCacheSettings(journalConfig),
+      protectSource ? buildMemorySource(e, scope, { eventId }) : null);
+    if (protectSource) store.memorySources.scheduleHistory(scope, store, () => this.getMessages(type, id, { strict: true }));
     const source = { scope, seq: recorded.seq, eventId };
     try { e._promptCacheSource = source; } catch {}
     return { formatted, source };
@@ -496,7 +504,17 @@ export class MessageManager {
       } catch (error) {
         formatted = context.formatted;
         logger.warn?.(`[PromptCacheV2] source recording failed: ${error.code || error.message}`);
+        if (isMemorySourceEnabled(context.journalConfig, id)) {
+          const scope = memoryScope(botIdForEvent(e), id);
+          await context.store.memorySources.noteFailure(scope, error);
+          await context.store.memorySources.record(scope, buildMemorySource(e, scope, { eventId: originKeyForEvent(e) }));
+        }
       }
+    }
+    // 对话/注入停用或退回 V1 不应暂停已选群的原料采集；此路径不创建对话账本。
+    if (!journalScope && isGroup && isMemorySourceEnabled(context.journalConfig, id)) {
+      const scope = memoryScope(botIdForEvent(e), id);
+      await context.store.memorySources.record(scope, buildMemorySource(e, scope, { eventId: originKeyForEvent(e) }));
     }
     let messages = await this.getMessages(type, id);
     messages.unshift(formatted || await this.formatMessage(e, options.messageMaxLength ?? this.MESSAGE_MAX_LENGTH)); // 在数组开头添加新消息

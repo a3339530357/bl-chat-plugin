@@ -17,6 +17,29 @@ function createManager() {
   })
 }
 
+test("V3 采集阶段停用旧自动提取：清理定时缓冲、取消旧请求、保留旧查询接口", async () => {
+  const manager = createManager()
+  let aborted = 0
+  let called = 0
+  manager.extractor.abortActiveRequests = () => { aborted++ }
+  manager.extractor.extractUserOperationResult = async () => { called++; throw new Error('must not call LLM') }
+  manager.extractor.extractGroupOperationResult = async () => { called++; throw new Error('must not call LLM') }
+  manager.store.getGroupMeta = async () => ({ disabled: false, lastAttemptAt: Date.now() })
+  await manager.enqueueInteraction({ groupId: '100', userId: '200', content: '我喜欢咖啡', source: 'user', messageId: 'old' })
+  await manager.extractAndSaveGroupMemories('100', [{ userId: '200', content: '今晚活动', source: 'user', messageId: 'group-old' }])
+  manager.updateConfig({ automaticExtraction: false })
+  assert.equal(manager.userBuffers.size, 0)
+  assert.equal(manager.groupBuffers.size, 0)
+  assert.equal(aborted, 1)
+  assert.equal((await manager.enqueueGroupEvent({ group_id: '100', user_id: '200' })).reason, 'manual-only')
+  assert.equal((await manager.extractAndSaveMemoriesNow('100', '200', [])).reason, 'manual-only')
+  assert.equal((await manager.extractAndSaveGroupMemoriesNow('100', [])).reason, 'manual-only')
+  assert.equal(called, 0)
+  manager.retrieveMemories = async () => ({ meta: { relationshipScore: 0.5 }, facts: [{ category: 'identity', content: '原有事实仍可查询' }] })
+  assert.match(await manager.getMemoryPromptForUser('100', '200'), /原有事实仍可查询/)
+  assert.equal(typeof manager.adminStatus, 'function')
+})
+
 function candidateOperation(messageId, content = "经常熬夜") {
   return {
     operation: "upsert",

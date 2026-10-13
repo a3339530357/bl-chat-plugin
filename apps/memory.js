@@ -1,5 +1,8 @@
 import { getSharedState } from "../core/sharedState.js"
 import common from "../../../lib/common/common.js"
+import { memorySourceStore } from "../utils/memory/MemorySourceStore.js"
+import { memorySourceStatusLines } from "../utils/memory/sourceStatus.js"
+import { botIdForEvent } from "../core/promptCache.js"
 
 /**
  * 记忆管理命令插件：查看 / 搜索 / 删除 / 清空 / 启停长期记忆。
@@ -100,6 +103,14 @@ export class MemoryCommands extends plugin {
         `群上次抽取：${this.formatMemoryTime(status.group?.lastAttemptAt)}`,
         `阈值：${status.config.importanceThreshold}，语义召回：${status.config.semanticRecallEnabled ? "开启" : "关闭"}`
       ]
+      if (e.group_id) {
+        try {
+          lines.push(...memorySourceStatusLines(await memorySourceStore.status(memorySourceStore.scope(botIdForEvent(e), e.group_id))))
+        } catch (error) {
+          lines.push("记忆原料状态读取失败，旧记忆状态如上")
+          logger.warn(`[MemorySource] 状态读取失败: ${error.message}`)
+        }
+      }
       await e.reply(lines.join("\n"))
     } catch (error) {
       logger.error("[记忆管理] 读取记忆状态失败:", error)

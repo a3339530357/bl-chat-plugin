@@ -4,6 +4,8 @@ import { getSharedState } from '../core/sharedState.js'
 import fs from 'fs';
 import YAML from 'yaml';
 import { isPromptCacheEnabled, botIdForEvent } from '../core/promptCache.js';
+import { isMemorySourceEnabled, memorySourceSettings } from '../utils/memory/sourceSchema.js';
+import { maybeRemindMemorySource } from '../utils/memory/sourceStatus.js';
 export class MessageRecordPlugin extends plugin {
     constructor() {
         super({
@@ -46,12 +48,15 @@ export class MessageRecordPlugin extends plugin {
         const state = getSharedState();
         const manager = isPromptCacheEnabled(state?.config, e.group_id)
             ? getV2MessageManager(state.config) : this.messageManager;
+        manager.promptCacheConfig = state?.config;
         await manager.recordMessage(e, { messageMaxLength: 200 });
         emojiPackManager.maybeAutoCollect(e).catch(() => {});
-        const memoryManager = getSharedState()?.memoryManager;
-        memoryManager?.enqueueGroupEvent(e).catch(error => {
-            logger.error(`[MemoryManager] 全局消息入队失败: ${error.stack || error}`);
-        });
+        // 原料已在 recordMessage 入账时保护；旧按消息/定时 LLM 提取不再启动。
+        if (isMemorySourceEnabled(state?.config, e.group_id)) {
+            maybeRemindMemorySource(e, memorySourceSettings(state.config)).catch(error => {
+                logger.warn(`[MemorySource] 积压提醒失败: ${error.message}`);
+            });
+        }
         return false;
     }
 

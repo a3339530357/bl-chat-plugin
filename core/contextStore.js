@@ -3,6 +3,8 @@ import { beijingDay, rollingScope, tokenEstimate, replayEventRow } from './promp
 import { stripHistoricalTurnReferences } from './prompts.js'
 import { ContextStoreError, nativeReplayRows, replayFormat, replayRows, REPLAY_RENDERER_VERSION } from './replayAdapters.js'
 import { contextNoteBlock } from './contextNotes.js'
+import { MemorySourceStore, memorySourceStore, MEMORY_SOURCE_LUA } from '../utils/memory/MemorySourceStore.js'
+import { SOURCE_PAGE_LIMIT } from '../utils/memory/sourceSchema.js'
 export { ContextStoreError, validateToolRows } from './replayAdapters.js'
 
 // Keep message/header JSON as strings in Lua: cjson round-trips [] as {}.
@@ -19,18 +21,29 @@ local active = redis.call('GET', KEYS[1])
 if not active then active = ARGV[1]; redis.call('SET', KEYS[1], active); redis.call('EXPIREAT', KEYS[1], tonumber(ARGV[3])) end
 return cjson.encode({resetId=active})`
 
+const RECORD_EXPIRE = `for index=1,5 do redis.call('EXPIREAT', KEYS[index], tonumber(ARGV[3])) end`
 const RECORD = `${GUARD}
+${MEMORY_SOURCE_LUA}
 local existing = redis.call('HGET', KEYS[4], ARGV[4])
-if existing then return cjson.encode({seq=tonumber(existing), duplicate=true}) end
+local seq = existing and tonumber(existing) or tonumber(redis.call('GET', KEYS[2]) or '0') + 1
+local memoryKeys = {KEYS[6], KEYS[7], KEYS[8], KEYS[9]}
+local memory, memoryError
+if ARGV[9] ~= '' then
+  memory, memoryError = prepareMemory(memoryKeys, ARGV[9], seq, ARGV[1])
+  if memoryError then return cjson.encode({error=memoryError}) end
+end
+if existing then
+  if memory then appendMemory(memoryKeys, memory, now) end
+  return cjson.encode({seq=seq, duplicate=true, memorySeq=memory and memory.seq})
+end
 if redis.call('EXISTS', KEYS[2]) == 0 and redis.call('ZCARD', KEYS[3]) > 0 then return cjson.encode({error='source_gap'}) end
 if tonumber(redis.call('HGET', KEYS[5], 'eventIndexCount') or '0') ~= redis.call('HLEN', KEYS[4]) then return cjson.encode({error='source_gap'}) end
 local sourceError = redis.call('HGET', KEYS[5], 'sourceError')
 if sourceError then return cjson.encode({error=sourceError}) end
-local seq = tonumber(redis.call('GET', KEYS[2]) or '0') + 1
 local event = {seq=seq, eventId=ARGV[4], payload=ARGV[5], tokens=tonumber(ARGV[6])}
 local encoded = cjson.encode(event)
 if redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[7]) or tonumber(redis.call('HGET', KEYS[5], 'rawBytes') or '0') + string.len(encoded) > tonumber(ARGV[8]) then
-  redis.call('HSET', KEYS[5], 'sourceError', 'raw_limit'); ${EXPIRE}
+  redis.call('HSET', KEYS[5], 'sourceError', 'raw_limit'); ${RECORD_EXPIRE}
   return cjson.encode({error='raw_limit'})
 end
 redis.call('INCR', KEYS[2])
@@ -38,8 +51,9 @@ redis.call('ZADD', KEYS[3], seq, encoded)
 redis.call('HSET', KEYS[4], ARGV[4], seq)
 redis.call('HSET', KEYS[5], 'eventIndexCount', redis.call('HLEN', KEYS[4]))
 redis.call('HINCRBY', KEYS[5], 'rawBytes', string.len(encoded))
-${EXPIRE}
-return cjson.encode({seq=seq})`
+if memory then appendMemory(memoryKeys, memory, now) end
+${RECORD_EXPIRE}
+return cjson.encode({seq=seq, memorySeq=memory and memory.seq})`
 
 const REFERENCE_HISTORY = `${GUARD}
 local count = redis.call('LLEN', KEYS[6])
@@ -53,7 +67,10 @@ for index, block in ipairs(blocks) do
   if current ~= block.before and current ~= block.after then return cjson.encode({retry=true}) end
 end
 for index, block in ipairs(blocks) do
-  if block.before ~= block.after then redis.call('LSET', KEYS[6], index-1, block.after) end
+  if block.before ~= block.after then
+    redis.call('LSET', KEYS[6], index-1, block.after)
+    redis.call('HINCRBY', KEYS[5], 'replayRevision', 1)
+  end
 end
 redis.call('HSET', KEYS[5], ARGV[5] or 'referenceCleanCount', #blocks)
 ${EXPIRE}
@@ -128,7 +145,10 @@ if total > tonumber(ARGV[5]) then
     dropped = dropped + 1
     total = total - blockCost(blocks[dropped])
   end
-  if dropped > 0 then redis.call('LTRIM', KEYS[6], dropped, -1) end
+  if dropped > 0 then
+    redis.call('LTRIM', KEYS[6], dropped, -1)
+    redis.call('HINCRBY', KEYS[5], 'replayRevision', 1)
+  end
   redis.call('HSET', KEYS[5], 'replayCount', redis.call('LLEN', KEYS[6]))
   local cleanCount = tonumber(redis.call('HGET', KEYS[5], 'referenceCleanCount') or '-1')
   redis.call('HSET', KEYS[5], 'referenceCleanCount', cleanCount == #blocks and (#blocks-dropped) or -1)
@@ -211,6 +231,7 @@ for _, candidate in ipairs(incoming) do
   redis.call('HSET', KEYS[7], candidate.eventId, '1')
 end
 redis.call('RPUSH', KEYS[6], ARGV[7])
+redis.call('HINCRBY', KEYS[5], 'replayRevision', 1)
 local represented = cjson.decode(ARGV[8])
 for _, id in ipairs(represented) do redis.call('HSET', KEYS[7], id, '1') end
 redis.call('HSET', KEYS[5], 'cursor', math.max(cursor, untilSeq))
@@ -239,6 +260,7 @@ if redis.call('HGET', KEYS[5], 'contextNoteState') ~= ARGV[6] or redis.call('LLE
 for index, encoded in ipairs(before) do
   if redis.call('LINDEX', KEYS[6], index-1) ~= encoded then return cjson.encode({retry=true}) end
 end
+redis.call('HINCRBY', KEYS[5], 'replayRevision', 1)
 redis.call('DEL', KEYS[6])
 for _, encoded in ipairs(after) do redis.call('RPUSH', KEYS[6], encoded) end
 redis.call('HSET', KEYS[5], 'replayCount', #after, 'referenceCleanCount', '-1', 'agentBudgetCount', '-1')
@@ -286,16 +308,73 @@ end
 for index, encoded in ipairs(before.blocks) do
   if redis.call('LINDEX', KEYS[6], index-1) ~= encoded then return cjson.encode({error='rollback_conflict'}) end
 end
+if redis.call('HGET', KEYS[9], 'status') == 'capturing' then
+  redis.call('HSET', KEYS[9], 'gap', 'replay_replaced', 'status', 'partial', 'finishedAt', now)
+end
 for index, encoded in ipairs(after.blocks) do redis.call('LSET', KEYS[6], index-1, encoded) end
 for field, _ in pairs(before.meta) do if after.meta[field] == nil then redis.call('HDEL', KEYS[5], field) end end
 for field, value in pairs(after.meta) do redis.call('HSET', KEYS[5], field, value) end
-${EXPIRE}
+for index=1,8 do redis.call('EXPIREAT', KEYS[index], tonumber(ARGV[3])) end
 return cjson.encode({replaced=#after.blocks})`
+
+// 首次启用时逐页保全旧 raw/replay。原始编码直接归档；不渲染、不裁剪，也不续账本 TTL。
+const CAPTURE_MEMORY = `${CLOCK}
+local captured = redis.call('HGET', KEYS[6], 'resetId')
+if not captured then
+  if redis.call('GET', KEYS[1]) ~= ARGV[1] then return cjson.encode({error='stale_scope'}) end
+  local cursor = tonumber(redis.call('HGET', KEYS[4], 'cursor') or '0')
+  redis.call('HSET', KEYS[6], 'resetId', ARGV[1], 'startedAt', now, 'rawFrom', cursor+1,
+    'rawUntil', redis.call('GET', KEYS[2]) or '0', 'rawNext', cursor, 'rawCaptured', 0,
+    'replayCount', redis.call('LLEN', KEYS[5]), 'replayNext', 0, 'replayCaptured', 0,
+    'replayRevision', redis.call('HGET', KEYS[4], 'replayRevision') or '0', 'status', 'capturing')
+end
+local status = redis.call('HGET', KEYS[6], 'status')
+if status ~= 'capturing' then return cjson.encode({done=true, status=status}) end
+if redis.call('GET', KEYS[1]) ~= redis.call('HGET', KEYS[6], 'resetId') then
+  redis.call('HSET', KEYS[6], 'status', 'partial', 'gap', 'scope_changed', 'finishedAt', now)
+  return cjson.encode({done=true, status='partial'})
+end
+local cursor = tonumber(redis.call('HGET', KEYS[6], 'rawNext'))
+local untilSeq = tonumber(redis.call('HGET', KEYS[6], 'rawUntil'))
+local limit = tonumber(ARGV[4])
+if cursor < untilSeq then
+  local rows = redis.call('ZRANGEBYSCORE', KEYS[3], '(' .. cursor, untilSeq, 'LIMIT', 0, limit)
+  for _, encoded in ipairs(rows) do
+    local row = cjson.decode(encoded)
+    if row.seq ~= cursor+1 then redis.call('HSET', KEYS[6], 'gap', 'raw_reclaimed') end
+    redis.call('HSET', KEYS[7], 'raw:' .. row.seq, encoded)
+    cursor = row.seq
+  end
+  if #rows == 0 then cursor = untilSeq; redis.call('HSET', KEYS[6], 'gap', 'raw_reclaimed') end
+  redis.call('HINCRBY', KEYS[6], 'rawCaptured', #rows)
+  redis.call('HSET', KEYS[6], 'rawNext', cursor)
+  return cjson.encode({done=false})
+end
+local replayNext = tonumber(redis.call('HGET', KEYS[6], 'replayNext'))
+local replayCount = tonumber(redis.call('HGET', KEYS[6], 'replayCount'))
+if replayNext < replayCount then
+  if (redis.call('HGET', KEYS[4], 'replayRevision') or '0') ~= redis.call('HGET', KEYS[6], 'replayRevision') or redis.call('LLEN', KEYS[5]) ~= replayCount then
+    redis.call('HSET', KEYS[6], 'gap', 'replay_changed', 'replayNext', replayCount)
+    return cjson.encode({done=false})
+  end
+  local rows = redis.call('LRANGE', KEYS[5], replayNext, math.min(replayCount, replayNext+limit)-1)
+  for _, encoded in ipairs(rows) do
+    redis.call('HSET', KEYS[7], 'replay:' .. replayNext, encoded)
+    replayNext = replayNext+1
+  end
+  redis.call('HSET', KEYS[6], 'replayNext', replayNext)
+  redis.call('HINCRBY', KEYS[6], 'replayCaptured', #rows)
+  return cjson.encode({done=false})
+end
+local result = redis.call('HEXISTS', KEYS[6], 'gap') == 1 and 'partial' or 'captured'
+redis.call('HSET', KEYS[6], 'status', result, 'finishedAt', now)
+return cjson.encode({done=true, status=result})`
 
 export class ContextStore {
   constructor(client = null, prefix = 'ytbot:ctx:v2:') {
     this.client = client
     this.prefix = prefix
+    this.memorySources = client ? new MemorySourceStore(client) : memorySourceStore
   }
 
   async evaluate(script, keys, args) {
@@ -332,13 +411,27 @@ export class ContextStore {
     return result.header ? JSON.parse(result.header) : null
   }
 
-  async record(scope, event, settings = {}) {
+  async record(scope, event, settings = {}, source = null) {
+    if (source && (source.eventId !== event.eventId || source.botId !== scope.botId || source.groupId !== scope.groupId)) throw new ContextStoreError('memory_source_scope')
     const row = replayEventRow(event, scope.botId)
     const value = { ...event, tokens: row ? tokenEstimate(row) : 0 }
-    return this.evaluate(RECORD, this.keys(scope).slice(0, 5), [
-      ...this.args(scope), event.eventId, JSON.stringify(value), value.tokens,
-      settings.rawMaxEvents || 20000, settings.rawMaxBytes || 33554432
-    ])
+    try {
+      const result = await this.evaluate(RECORD, [...this.keys(scope).slice(0, 5), ...(source ? this.memorySources.keys(scope) : [])], [
+        ...this.args(scope), event.eventId, JSON.stringify(value), value.tokens,
+        settings.rawMaxEvents || 20000, settings.rawMaxBytes || 33554432, source ? JSON.stringify(source) : ''
+      ])
+      if (source) await this.memorySources.flushError(scope)
+      return result
+    } catch (error) {
+      if (source) await this.memorySources.noteFailure(scope, error)
+      throw error
+    }
+  }
+
+  async captureMemoryPage(scope, limit = SOURCE_PAGE_LIMIT) {
+    const keys = this.keys(scope)
+    return this.evaluate(CAPTURE_MEMORY, [keys[0], keys[1], keys[2], keys[4], keys[5], ...this.memorySources.snapshotKeys(scope)],
+      [...this.args(scope), Math.max(1, Math.min(SOURCE_PAGE_LIMIT, Math.floor(limit) || SOURCE_PAGE_LIMIT))])
   }
 
   async read(scope, header, settings, incomingTokens = 0, currentOrigin = '', compactAttempt = 0) {
@@ -447,7 +540,7 @@ export class ContextStore {
 
   async replaceReplay(scope, before, after) {
     after.blocks.forEach(encoded => nativeReplayRows(JSON.parse(encoded)))
-    return this.evaluate(REPLACE_REPLAY, this.keys(scope), [...this.args(scope), JSON.stringify({ before, after })])
+    return this.evaluate(REPLACE_REPLAY, [...this.keys(scope), this.memorySources.snapshotKeys(scope)[0]], [...this.args(scope), JSON.stringify({ before, after })])
   }
 
   async reset(botId, groupId, { now = Date.now(), settings = null } = {}) {

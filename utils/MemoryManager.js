@@ -154,6 +154,7 @@ export class MemoryManager {
   }
 
   async enqueueGroupEvent(event = {}) {
+    if (this.config.automaticExtraction === false) return { queued: false, reason: "manual-only" }
     if (!this.isMemoryActive()) return { queued: false, reason: "disabled" }
     if (!this.extractor.canUseMemoryAi()) return { queued: false, reason: "ai-unavailable" }
     if (!event.group_id || !event.user_id) return { queued: false, reason: "not-group-message" }
@@ -211,6 +212,7 @@ export class MemoryManager {
   }
 
   async enqueueInteraction(event = {}) {
+    if (this.config.automaticExtraction === false) return { queued: false, reason: "manual-only" }
     if (!this.isMemoryActive()) return { queued: false, reason: "disabled" }
     if (!this.extractor.canUseMemoryAi()) return { queued: false, reason: "ai-unavailable" }
     const interaction = this.normalizeInteraction(event)
@@ -621,7 +623,7 @@ export class MemoryManager {
   }
 
   isMemoryExtractionActive() {
-    return Boolean(this.isMemoryActive() && this.extractor.canUseMemoryAi())
+    return Boolean(this.config.automaticExtraction !== false && this.isMemoryActive() && this.extractor.canUseMemoryAi())
   }
 
   mergeBufferedMessages(...groups) {
@@ -664,6 +666,7 @@ export class MemoryManager {
   }
 
   async extractAndSaveMemories(groupId, userId, userMessage, botReply = "", meta = {}) {
+    if (this.config.automaticExtraction === false) return { queued: false, reason: "manual-only" }
     if (!this.isMemoryActive()) return { queued: false, reason: "disabled" }
     if (!this.extractor.canUseMemoryAi()) return { queued: false, reason: "ai-unavailable" }
     const interaction = this.normalizeInteraction({
@@ -756,6 +759,7 @@ export class MemoryManager {
   }
 
   async extractAndSaveMemoriesNow(groupId, userId, messagesOrUserMessage = []) {
+    if (this.config.automaticExtraction === false) return { queued: false, reason: "manual-only" }
     if (!this.isMemoryActive()) return { saved: 0, deleted: 0, skipped: 0, reason: "disabled" }
     if (!this.extractor.canUseMemoryAi()) {
       logger?.debug?.("[MemoryManager] memoryAiConfig 配置不完整，跳过用户记忆抽取")
@@ -910,6 +914,7 @@ export class MemoryManager {
   }
 
   async extractAndSaveGroupMemories(groupId, chatHistory = []) {
+    if (this.config.automaticExtraction === false) return { queued: false, reason: "manual-only" }
     if (!this.isMemoryActive()) return { queued: false, reason: "disabled" }
     if (!this.extractor.canUseMemoryAi()) return { queued: false, reason: "ai-unavailable" }
     if (!groupId || !Array.isArray(chatHistory) || !chatHistory.length) {
@@ -986,6 +991,7 @@ export class MemoryManager {
   }
 
   async extractAndSaveGroupMemoriesNow(groupId, messagesOrHistory = [], { force = false } = {}) {
+    if (this.config.automaticExtraction === false) return { queued: false, reason: "manual-only" }
     if (!this.isMemoryActive()) return { saved: 0, deleted: 0, skipped: 0, reason: "disabled" }
     if (!this.extractor.canUseMemoryAi()) {
       logger?.debug?.("[MemoryManager] memoryAiConfig 配置不完整，跳过群记忆抽取")
