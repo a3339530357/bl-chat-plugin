@@ -56,7 +56,7 @@ after(async () => {
 })
 
 async function workflow({ enabled = true, currentMode = 'text', message = 'hello', tool = 'probe', video = false, groupId, useTools = true,
-  textImage = false, store = null, identityFailure = false, singleStage = false, sendFailure = false, dedupe = false, configure, afterDispatch } = {}) {
+  textImage = false, store = null, identityFailure = false, singleStage = false, sendFailure = false, dedupe = false, configure, afterDispatch, memoryTail = null } = {}) {
   mode = currentMode
   selectedTool = tool
   decisions = 0
@@ -92,6 +92,7 @@ async function workflow({ enabled = true, currentMode = 'text', message = 'hello
   owner.recordReplyLatency = () => {}
   owner.emotionManager = { getEmotionPromptForGroup: async () => 'current mood' }
   owner.memoryManager = { getMemoryPromptForUser: async () => 'user memory', getGroupMemoryPrompt: async () => 'group memory' }
+  if (memoryTail !== null) owner.memoryService = { buildMemoryTail: async () => { if (memoryTail instanceof Error) throw memoryTail; return memoryTail } }
   owner.expressionLearner = { getExpressionPromptForGroup: async () => 'current style' }
   owner.knowledgeSearcher = { search: async () => ({ knowledgeContext: 'reference knowledge' }) }
   owner.updateEnhancedSystems = async () => {}
@@ -151,6 +152,38 @@ test('actual agent text sends one request with full current data and commits raw
   assert.ok(!block.apiRows[0].content.includes('本轮参考资料'))
   assert.equal(result.replies.length, 1)
   assert.equal(block.delivery.status, 'sent')
+})
+
+for (const singleStage of [false, true]) {
+  test(`V3 memoryTail stays transient in actual ${singleStage ? 'agent' : 'dual'} requests across three turns`, async () => {
+    const first = await workflow({ singleStage, memoryTail: 'V3_ONLY_ALPHA' })
+    assert.ok(requests.some(request => request.messages.at(-1).content.includes('V3_ONLY_ALPHA')))
+    assert.ok(requests.every(request => !JSON.stringify(request.messages[0]).includes('V3_ONLY_ALPHA')))
+    let snapshot = await contextStore.exportSnapshot(first.session.cacheTurn.scope)
+    assert.ok(!JSON.stringify(snapshot).includes('V3_ONLY_ALPHA'))
+    const second = await workflow({ singleStage, groupId: first.group, memoryTail: 'V3_ONLY_BETA', message: 'second' })
+    assert.ok(requests.some(request => request.messages.at(-1).content.includes('V3_ONLY_BETA')))
+    assert.ok(!JSON.stringify(second.session.cacheTurn.toolBase.slice(0, -1)).includes('V3_ONLY_'))
+    const third = await workflow({ singleStage, groupId: first.group, memoryTail: 'V3_ONLY_GAMMA', message: 'third' })
+    const base = second.session.cacheTurn.toolBase
+    assert.deepEqual(third.session.cacheTurn.toolBase.slice(0, base.length - 1), base.slice(0, -1))
+    snapshot = await contextStore.exportSnapshot(third.session.cacheTurn.scope)
+    assert.ok(!JSON.stringify(snapshot).includes('V3_ONLY_'))
+  })
+}
+
+test('V3 retrieval failure still completes the main conversation and disabled tail emits no old memory', async () => {
+  const result = await workflow({ singleStage: true, memoryTail: new Error('memory_read_failed') })
+  assert.deepEqual(result.replies, ['OK'])
+  assert.ok(errors.some(error => error.includes('memory_read_failed')))
+  assert.ok(!JSON.stringify(requests).includes('user memory'))
+})
+
+test('V1 fallback uses a transient V3 memory suffix and strips it before history persistence', async () => {
+  const result = await workflow({ enabled: false, memoryTail: 'V3_ONLY_LEGACY_FALLBACK' })
+  assert.ok(requests.some(request => JSON.stringify(request.messages).includes('V3_ONLY_LEGACY_FALLBACK')))
+  assert.ok(requests.every(request => !JSON.stringify(request.messages[0]).includes('V3_ONLY_LEGACY_FALLBACK')))
+  assert.ok(!JSON.stringify(result.session.groupUserMessages).includes('V3_ONLY_LEGACY_FALLBACK'))
 })
 
 test('unchanged second/third agent turns omit reference data and reuse their frozen prefix', async () => {

@@ -136,6 +136,30 @@ test('current member delta is request-only, stored separately, and never counts 
   assert.ok(snapshot.blocks.some(value => value.contextNotes?.some(entry => entry.key === 'member:123')))
 })
 
+test('V3 retires old memory references without rewriting history and stale writers cannot restore them', async () => {
+  const { store, scope } = await context()
+  let snapshot = await store.read(scope, header, settings)
+  await commit(store, scope, snapshot, planContextNotes(snapshot, referenceFacts(snapshot, { 用户记忆: 'OLD_MEMORY' }, '123')))
+  await store.prepareAgentBudgets(scope)
+  const before = (await store.exportSnapshot(scope)).blocks
+  const owner = { ...sessionHistoryMethods, contextStore: store, config: { promptCache: { diagnostics: false } }, getTaskStatus: async () => null, formatTaskStatusForPrompt: () => '' }
+  const e = { self_id: 'bot', group_id: 'group', user_id: '123', message_id: 'v3', sender: { user_id: '123', nickname: 'Alice' } }
+  const manager = { recordMessage: async () => store.record(scope, { eventId: 'message:bot:group:v3', message: { ...e, content: 'hello' } }) }
+  const turn = await owner.preparePromptCacheTurn({ e, session: { turnId: 'v3-turn' }, scope, header, userContent: 'hello', references: { 用户记忆: 'SHOULD_NOT_UPDATE' }, memoryTail: 'CURRENT_MEMORY', manager, allowedTools: [], agentControls: {} })
+  assert.ok(!turn.userRow.content.includes('SHOULD_NOT_UPDATE'))
+  assert.ok(turn.userRow.content.includes('CURRENT_MEMORY'))
+  await owner.commitPromptCacheTurn({ cacheTurn: turn }, e)
+  assert.deepEqual((await store.exportSnapshot(scope)).blocks.slice(0, before.length), before)
+  snapshot = await store.read(scope, header, settings)
+  const legacy = planContextNotes(snapshot, referenceFacts(snapshot, { 用户记忆: 'STALE_RESTORATION' }, '123'))
+  await commit(store, scope, snapshot, legacy, 'old-writer')
+  snapshot = await store.read(scope, header, { ...settings, noteCompactChanges: 2 })
+  assert.equal(snapshot.noteState['reference:QQ=123:用户记忆'].retired, true)
+  assert.ok(!snapshot.blocks.some(item => item.contextBaseline && JSON.stringify(item).includes('OLD_MEMORY')))
+  assert.ok(!JSON.stringify(snapshot.blocks).includes('CURRENT_MEMORY'))
+  assert.ok(!JSON.stringify(snapshot.blocks).includes('STALE_RESTORATION'))
+})
+
 test('retired summaries disappear at compression and stale turns cannot resurrect them', async () => {
   const { store, scope } = await context()
   let snapshot = await store.read(scope, header, settings)

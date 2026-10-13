@@ -42,3 +42,15 @@
 批次边界、输入摘要、模型版本、长消息分片和已完成分片结果持久化。上下文与已有事实按预算选择；长消息原件仍完整保留，只对模型输入做分片。分片和候选 JSON 以字符串经过 Lua，避免空数组变形。使用固定边界重试，不自动改变范围缩批；超过重试或提交大小上限则保留失败状态和原料。
 
 提取和证据审核是两个独立调用，均有独立超时/取消。合法空结果可以提交；无效 JSON、截断或不完整审核结果不能当空结果推进。相对日期以原消息时间换算；历法、年份无依据时进入歧义确认。独立审核仍是模型判断，不能保证零误记；程序检查引用和身份，并保留来源与审核依据供主人复核。
+
+## 阶段 4：双轨召回与临时 tail
+
+`MemoryRetrieverV3.buildMemoryTail()` 一次读取同群的一致快照。active/core 事实按 QQ 和槽位排序，全量常驻；核心视图按 scope+memoryRevision 缓存。超过 coreTokens 时显式报错并通过状态命令展示，主对话可以降级继续，不偷偷截断后冒称全量。
+
+事件以当前文本、已解析的引用/当前用户内容、明确 @ 和最多十条最近真实群消息构建 query。本地中文关键词/二元组结合人物、年份排序；支持“今年/去年/前年”，不对旧事件做强时间衰减。低相关结果返回空，最多八条并限制独立 token 预算。重名昵称不自动映射到单个 QQ，明确 @ 可以消歧。时间精度和 planned/occurred/cancelled/unknown 均在输出中保留。
+
+新记忆通过独立 `memoryTail` 参数经过 `apps/chat.js → preparePromptCacheTurn → buildTurnReferenceContent`。它不进入 header、referenceFacts 或 planContextNotes；CacheTurn 精确剥离本轮后缀后再提交历史。V1 回退也只给当前用户行加后缀，并在保存历史前去掉。
+
+V3 开始使用后，账本记录 memoryReferencesRetired 标记：旧个人/群记忆注记退役，基线不再恢复它们；旧 writer 的提交也会将这些键维持为 tombstone。已有块不因新记忆更新而改写，仍由原有裁剪/注记压缩机制处理。
+
+`memoryV3.injectEnabled=false` 关闭新注入而不删除记忆或来源；读取失败、空记忆和预算超限有不同诊断状态。当前不加入在线 embedding/LLM 检索调用，检索策略可替换 `retrieveEvents()` 接口。

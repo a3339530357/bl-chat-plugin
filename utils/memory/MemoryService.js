@@ -4,6 +4,7 @@ import { MemoryStoreV3, memoryHash } from './MemoryStoreV3.js'
 import { MemoryExtractorV3, memoryV3Settings, memoryV3Enabled } from './MemoryExtractorV3.js'
 import { MemoryJobs } from './MemoryJobs.js'
 import { tokenEstimate } from '../../core/promptCache.js'
+import { MemoryRetrieverV3 } from './MemoryRetrieverV3.js'
 
 let extractionQueue = Promise.resolve()
 
@@ -13,6 +14,7 @@ export class MemoryService {
     this.store = store
     this.jobs = new MemoryJobs(store)
     this.extractor = new MemoryExtractorV3(config, model)
+    this.retriever = new MemoryRetrieverV3(store, config)
     this.running = new Map()
     this.controllers = new Map()
     this.recoveryTimers = new Map()
@@ -21,10 +23,16 @@ export class MemoryService {
   updateConfig(config) {
     this.config = config
     this.extractor.updateConfig(config)
+    this.retriever.updateConfig(config)
     for (const { scope, controller } of this.controllers.values()) if (!this.enabled(scope)) controller.abort()
   }
 
   enabled(scope) { return memoryV3Enabled(this.config, scope.groupId) && memoryV3Settings(this.config).organizeEnabled }
+
+  buildMemoryTail(input) {
+    if (!memoryV3Enabled(this.config, input.groupId) || !memoryV3Settings(this.config).injectEnabled) return Promise.resolve('')
+    return this.retriever.buildMemoryTail(input)
+  }
 
   async start(scope) {
     if (!this.enabled(scope)) throw new Error('memory_organizing_disabled')

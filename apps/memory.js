@@ -156,6 +156,9 @@ export class MemoryCommands extends plugin {
       if (e.group_id) {
         try {
           lines.push(...memorySourceStatusLines(await memorySourceStore.status(memorySourceStore.scope(botIdForEvent(e), e.group_id))))
+          const service = getSharedState()?.memoryService
+          const diagnostic = service?.retriever.status.get(memorySourceStore.scope(botIdForEvent(e), e.group_id).root)
+          if (diagnostic) lines.push(`本轮记忆召回状态：${diagnostic.state}；核心 ${diagnostic.coreTokens || 0} token${diagnostic.budget ? ` / 预算 ${diagnostic.budget}` : ''}`)
         } catch (error) {
           lines.push("记忆原料状态读取失败，旧记忆状态如上")
           logger.warn(`[MemorySource] 状态读取失败: ${error.message}`)

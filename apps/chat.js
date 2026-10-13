@@ -27,6 +27,7 @@ import { sessionHistoryMethods } from "../core/sessionHistory.js"
 import { mcpLifecycleMethods, startMcpInit } from "../core/mcpLifecycle.js"
 import { agentLoopMethods } from '../core/agentLoop.js'
 import { resolveAgentRoute } from '../utils/apiClient.js'
+import { memoryV3Enabled } from '../utils/memory/MemoryExtractorV3.js'
 
 const _path = process.cwd()
 
@@ -62,6 +63,7 @@ export class ChatPlugin extends plugin {
     this.sessionMap = state.sessionMap
     this.emotionManager = state.emotionManager
     this.memoryManager = state.memoryManager
+    this.memoryService = state.memoryService
     this.expressionLearner = state.expressionLearner
     this.knowledgeSearcher = state.knowledgeSearcher
     this.REDIS_KEY_PREFIX = 'ytbot:messages:'
@@ -590,10 +592,12 @@ export class ChatPlugin extends plugin {
 
         // 情感/记忆/表达学习/知识库/画像/群上下文 这几个 prompt 互相独立，并行构建。
         // 原来是逐个 await 串行，多个含 embedding/RPC 的慢调用会累加，是 @ 回复慢的主因之一。
+        const useMemoryV3 = Boolean(this.memoryService && memoryV3Enabled(this.config, groupId))
         const [
           emotionPrompt,
           memoryPrompt,
           groupMemoryPrompt,
+          memoryTail,
           expressionPrompt,
           knowledgePrompt,
           personProfilePrompt,
@@ -602,12 +606,20 @@ export class ChatPlugin extends plugin {
           this.config.emotionSystem?.enabled
             ? this.emotionManager.getEmotionPromptForGroup(groupId).catch(err => { logger.error(`[情感] 获取失败: ${err.message}`); return '' })
             : Promise.resolve(''),
-          this.config.memorySystem?.enabled
+          this.config.memorySystem?.enabled && !useMemoryV3
             ? this.memoryManager.getMemoryPromptForUser(groupId, userId, e.msg || "").catch(err => { logger.error(`[记忆] 用户检索失败: ${err.message}`); return '' })
             : Promise.resolve(''),
-          this.config.memorySystem?.enabled && groupId
+          this.config.memorySystem?.enabled && groupId && !useMemoryV3
             ? this.memoryManager.getGroupMemoryPrompt(groupId, e.msg || "").catch(err => { logger.error(`[记忆] 群检索失败: ${err.message}`); return '' })
             : Promise.resolve(''),
+          useMemoryV3
+            ? this.messageManager.getMessages('group', groupId).then(recent => this.memoryService.buildMemoryTail({
+                botId: botIdForEvent(e), groupId, userId,
+                queryContext: { text: e.msg || '', reference: userContent,
+                  mentions: (e.message || []).filter(item => item.type === 'at').map(item => String(item.qq)),
+                  recent: recent.filter(row => String(row.sender?.user_id) !== botIdForEvent(e)).slice(0, 10) }
+              })).catch(err => { logger.error(`[MemoryV3] 召回不可用: ${err.message}`); return '' })
+            : Promise.resolve(null),
           this.config.expressionLearning?.enabled
             ? this.expressionLearner.getExpressionPromptForGroup(groupId).catch(err => { logger.error(`[表达学习] 获取失败: ${err.message}`); return '' })
             : Promise.resolve(''),
@@ -716,7 +728,7 @@ export class ChatPlugin extends plugin {
             }
             const manager = getV2MessageManager(cacheConfig, { update: false })
             session.cacheTurn = await this.preparePromptCacheTurn({
-              e, session, scope, header, userContent: userContent + avatar, manager, allowedTools, agentControls, config: cacheConfig,
+              e, session, scope, header, userContent: userContent + avatar, memoryTail, manager, allowedTools, agentControls, config: cacheConfig,
               participants: participantList,
               profileMessages: personProfilePrompt?.recentMessages || [],
               references: {
@@ -796,6 +808,10 @@ ${v1Participants}` : '') })
           groupUserMessages = this.trimMessageHistory(groupUserMessages)
           groupUserMessages = this.filterChatByQQ(groupUserMessages, e.user_id)
           session.groupUserMessages = this.formatMessages(groupUserMessages, e, userContent)
+          if (memoryTail) {
+            session.memoryTailSuffix = `\n\n${memoryTail}`
+            session.groupUserMessages.at(-1).content += session.memoryTailSuffix
+          }
         }
 
         let toolChoice = "auto"
@@ -983,6 +999,14 @@ ${v1Participants}` : '') })
     }
 
     messages.push({ role: "assistant", content: output })
+    if (session.memoryTailSuffix) {
+      for (let index = messages.length - 1; index >= 0; index--) {
+        if (messages[index].role === 'user' && typeof messages[index].content === 'string' && messages[index].content.endsWith(session.memoryTailSuffix)) {
+          messages[index] = { ...messages[index], content: messages[index].content.slice(0, -session.memoryTailSuffix.length) }
+          break
+        }
+      }
+    }
     session.groupUserMessages = this.trimMessageHistory(messages)
     await this.saveGroupUserMessages(e.group_id, e.user_id, messages)
 

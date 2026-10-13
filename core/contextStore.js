@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { beijingDay, rollingScope, tokenEstimate, replayEventRow } from './promptCache.js'
 import { stripHistoricalTurnReferences } from './prompts.js'
 import { ContextStoreError, nativeReplayRows, replayFormat, replayRows, REPLAY_RENDERER_VERSION } from './replayAdapters.js'
-import { contextNoteBlock } from './contextNotes.js'
+import { contextNoteBlock, isLegacyMemoryNote } from './contextNotes.js'
 import { MemorySourceStore, memorySourceStore, MEMORY_SOURCE_LUA } from '../utils/memory/MemorySourceStore.js'
 import { SOURCE_PAGE_LIMIT } from '../utils/memory/sourceSchema.js'
 export { ContextStoreError, validateToolRows } from './replayAdapters.js'
@@ -99,6 +99,7 @@ for _, encoded in ipairs(events) do
 end
 if expected ~= untilSeq + 1 then return cjson.encode({error='source_gap'}) end
 if incoming > tonumber(ARGV[5]) then return cjson.encode({error='incoming_overflow'}) end
+if ARGV[13] == '1' then redis.call('HSET', KEYS[5], 'memoryReferencesRetired', '1') end
 local headerKey = ARGV[10]
 local header = redis.call('HGET', KEYS[5], headerKey)
 local candidate = ARGV[4]
@@ -174,7 +175,8 @@ return cjson.encode({cursor=cursor, readUntil=untilSeq, events=decodedEvents, bl
   header=header, headerChanged=changed, modeChanged=previousMode and previousMode~=ARGV[11] or false,
   firstModeUse=not previousMode, projectionChanged=projectionChanged, dropped=dropped, estimatedTokens=total,
   rawCount=redis.call('ZCARD', KEYS[3]), rawBytes=tonumber(redis.call('HGET', KEYS[5], 'rawBytes') or '0'),
-  noteState=noteState, noteClock=noteClock, identityEvents=identityEvents})`
+  noteState=noteState, noteClock=noteClock, identityEvents=identityEvents,
+  memoryReferencesRetired=redis.call('HGET', KEYS[5], 'memoryReferencesRetired') == '1'})`
 
 const COMMIT = `${GUARD}
 if redis.call('HEXISTS', KEYS[8], ARGV[4]) == 1 then return cjson.encode({duplicate=true}) end
@@ -211,6 +213,13 @@ if #notes > 0 then
 end
 for _, candidate in ipairs(notes) do
   local entry = cjson.decode(candidate.entryJson)
+  if redis.call('HGET', KEYS[5], 'memoryReferencesRetired') == '1' and string.sub(entry.key, 1, 10) == 'reference:' then
+    for _, suffix in ipairs({':用户记忆', ':群记忆', ':memory'}) do
+      if string.sub(entry.key, -string.len(suffix)) == suffix then
+        entry.retired=true; entry.valueJson='null'; entry.text=''; candidate.entryJson=cjson.encode(entry)
+      end
+    end
+  end
   local previous = state[entry.key] and cjson.decode(state[entry.key])
   if not previous or entry.version >= previous.version then
     if not entry.retired and (not visible[entry.key] or visible[entry.key].valueJson ~= entry.valueJson) then
@@ -440,7 +449,8 @@ export class ContextStore {
     const result = await this.evaluate(READ, this.keys(scope).slice(0, 7), [
       ...this.args(scope), JSON.stringify(header), settings.highWater, settings.lowWater,
       incomingTokens + settings.reserveTokens, currentOrigin, header.reliable === false ? '0' : '1',
-      header.mode === 'agent' ? 'agentHeader' : 'header', header.mode === 'agent' ? 'agent' : 'dual', header.rendererVersion || REPLAY_RENDERER_VERSION
+      header.mode === 'agent' ? 'agentHeader' : 'header', header.mode === 'agent' ? 'agent' : 'dual', header.rendererVersion || REPLAY_RENDERER_VERSION,
+      settings.retireMemoryReferences ? '1' : '0'
     ])
     // Redis cjson encodes an empty Lua array as {}, not [].
     result.events = Array.isArray(result.events)
@@ -457,7 +467,7 @@ export class ContextStore {
     const compact = deltaNotes.length >= (settings.noteCompactChanges || 32) ||
       deltaNotes.reduce((sum, block) => sum + block.tokens, 0) >= (settings.noteCompactTokens || 2048)
     if (compact && notes.length > 1 && compactAttempt < 3) {
-      const baseline = contextNoteBlock(Object.values(result.noteState).filter(entry => !entry.retired && entry.valueJson !== 'null').sort((a, b) => a.key.localeCompare(b.key)), { baseline: true })
+      const baseline = contextNoteBlock(Object.values(result.noteState).filter(entry => !entry.retired && entry.valueJson !== 'null' && !((settings.retireMemoryReferences || result.memoryReferencesRetired) && isLegacyMemoryNote(entry.key))).sort((a, b) => a.key.localeCompare(b.key)), { baseline: true })
       // A baseline must be trimmed last, after old conversation blocks. Putting
       // it at index zero causes capacity -> restore -> recompress oscillation.
       // Readers arbitrate facts by version, so physical position is immaterial.

@@ -10,7 +10,7 @@ import { originKeyForEvent, promptCacheSettings, replayEventRow, tokenEstimate, 
 import { buildTurnReferenceContent } from './prompts.js'
 import { taskStatusMethods } from './taskStatus.js'
 import { replayRows } from './replayAdapters.js'
-import { participantFacts, planContextNotes, referenceFacts, profileFacts } from './contextNotes.js'
+import { participantFacts, planContextNotes, referenceFacts, profileFacts, retiredMemoryFacts } from './contextNotes.js'
 import { toolHistoryFacts } from './toolHistory.js'
 import { dumpTurnTail } from './tailDump.js'
 import { replayToolResults } from './replayCoverage.js'
@@ -18,9 +18,11 @@ import { replayToolResults } from './replayCoverage.js'
 const _path = process.cwd()
 
 export const sessionHistoryMethods = {
-  async preparePromptCacheTurn({ e, session, scope, header, userContent, references, participants = [], profileMessages = [], manager, allowedTools, agentControls, config = this.config, extraIncomingTokens = 0, prepareAttempt = 0 }) {
+  async preparePromptCacheTurn({ e, session, scope, header, userContent, references, memoryTail = null, participants = [], profileMessages = [], manager, allowedTools, agentControls, config = this.config, extraIncomingTokens = 0, prepareAttempt = 0 }) {
     const store = this.contextStore || contextStore
     const settings = promptCacheSettings(config)
+    settings.retireMemoryReferences = memoryTail !== null
+    if (memoryTail !== null) references = Object.fromEntries(Object.entries(references).filter(([key]) => !['用户记忆', '群记忆', 'memory'].includes(key)))
     const sourceReferences = references
     await manager.recordMessage(e, {
       journalOnly: true, messageMaxLength: 200, promptCacheConfig: config,
@@ -29,13 +31,15 @@ export const sessionHistoryMethods = {
     const origin = originKeyForEvent(e)
     const preliminary = buildTurnReferenceContent({
       userId: e.user_id,
-      references: { time: references['北京时间'] || references.time }, allowedTools, agentControls, declaredTools: header.tools
+      references: { time: references['北京时间'] || references.time }, memoryTail, allowedTools, agentControls, declaredTools: header.tools
     })
     const agent = header.mode === 'agent'
     const incomingTokens = (agent ? tokenEstimate(header.agentSystem) + tokenEstimate(header.tools) :
       Math.max(tokenEstimate(header.toolSystem) + tokenEstimate(header.tools), tokenEstimate(header.chatSystem))) +
       tokenEstimate(userContent + preliminary) + extraIncomingTokens
     const snapshot = await store.read(scope, header, settings, incomingTokens, origin)
+    const retireMemory = memoryTail !== null || snapshot.memoryReferencesRetired
+    if (retireMemory) references = Object.fromEntries(Object.entries(references).filter(([key]) => !['用户记忆', '群记忆', 'memory'].includes(key)))
     if (snapshot.headerChanged) cacheDiagnostic(config, 'header_change', { groupId: scope.groupId })
     if (snapshot.modeChanged) cacheDiagnostic(config, 'mode_switch', { groupId: scope.groupId, mode: agent ? 'agent' : 'dual' })
     if (snapshot.projectionChanged) cacheDiagnostic(config, 'projection_change', { groupId: scope.groupId })
@@ -71,7 +75,8 @@ export const sessionHistoryMethods = {
     const retiredTasks = Object.keys(snapshot.noteState).filter(key => key.startsWith('task:') && !taskKeys.has(key))
       .map(key => ({ key, value: null, text: '', retired: true }))
     const notePlan = planContextNotes(snapshot, [...participantFacts(snapshot, participants, e), ...taskFacts, ...historyFacts, ...retiredTasks,
-      ...referenceFacts(snapshot, references, e.user_id), ...profileFacts(snapshot, profileMessages, e.user_id, e.message_id, userContent, observers)])
+      ...referenceFacts(snapshot, references, e.user_id), ...profileFacts(snapshot, profileMessages, e.user_id, e.message_id, userContent, observers),
+      ...(retireMemory ? retiredMemoryFacts(snapshot) : [])])
     references = { time: references['北京时间'] || references.time, updates: notePlan.content }
     const selected = this.filterChatByQQ([
       ...observers.flatMap(observer => replayRows(observer.block, agent ? 'agent' : 'tools')), { role: 'user', content: userContent }
@@ -84,7 +89,7 @@ export const sessionHistoryMethods = {
     }
     const referenceContent = buildTurnReferenceContent({
       userId: e.user_id,
-      references, allowedTools, newObserverCount, agentControls, declaredTools: snapshot.header.tools
+      references, memoryTail, allowedTools, newObserverCount, agentControls, declaredTools: snapshot.header.tools
     })
     const turn = new CacheTurn({
       turnId: session.turnId, scope, snapshot, observers, represented, settings, messageId: e.message_id,
@@ -97,7 +102,7 @@ export const sessionHistoryMethods = {
       const required = Math.max(tokenEstimate(referenceContent) - tokenEstimate(preliminary),
         extraIncomingTokens + requestTokens + settings.reserveTokens - settings.highWater + 64)
       if (prepareAttempt < 2) return this.preparePromptCacheTurn({
-        e, session, scope, header, userContent, references: sourceReferences, participants, profileMessages, manager,
+        e, session, scope, header, userContent, references: sourceReferences, memoryTail, participants, profileMessages, manager,
         allowedTools, agentControls, config, extraIncomingTokens: required, prepareAttempt: prepareAttempt + 1
       })
       throw new ContextStoreError('incoming_overflow')

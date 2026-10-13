@@ -1,6 +1,12 @@
 import { tokenEstimate, botIdForEvent } from './promptCache.js'
 import { nativeReplayRows } from './replayAdapters.js'
 
+export const isLegacyMemoryNote = key => /^reference:.*:(?:用户记忆|群记忆|memory)$/.test(key)
+
+export function retiredMemoryFacts(snapshot) {
+  return Object.keys(snapshot.noteState || {}).filter(isLegacyMemoryNote).map(key => ({ key, value: null, text: '', retired: true }))
+}
+
 // Facts are versioned independently of source messages. Hashes are deliberately
 // not identities: A -> B -> A is three updates, and a trimmed A must be restorable.
 export function visibleContextNotes(blocks = []) {
