@@ -104,13 +104,13 @@ const legacyFields = [
 
 export default [
   { component: 'SOFT_GROUP_BEGIN', label: '长期记忆 V3' },
-  { field: 'memoryV3.enabled', label: '长期记忆 V3', component: 'Switch', bottomHelpMessage: '关闭整理和注入，不删除已保护数据，不重新开启旧自动提取' },
-  { field: 'memoryV3.groups', label: '启用记忆的群', component: 'GTags', componentProps: { allowAdd: true, allowDel: true }, bottomHelpMessage: '填群号；未配置时沿用原料采集群，显式空列表表示不启用任何群' },
-  { field: 'memoryV3.organizeEnabled', label: '允许主人整理', component: 'Switch', bottomHelpMessage: '主人发送 #整理记忆 才启动；关闭会暂停任务，原料仍保留' },
-  { field: 'memoryV3.injectEnabled', label: '对话使用长期记忆', component: 'Switch', bottomHelpMessage: '核心事实与相关群事件仅作为本轮尾部资料' },
-  { field: 'memoryV3.reclaimEnabled', label: '回收已整理原料', component: 'Switch', bottomHelpMessage: '只回收已成功提交且证据已另存的原料，保留末尾20条语境；未整理原料不删除' },
-  { field: 'memoryV3.coreTokens', label: '核心事实预算', component: 'InputNumber', componentProps: { min: 64, max: 16000 }, bottomHelpMessage: '超限会在记忆状态中显示，需精简核心事实；不会静默截断' },
-  { field: 'memorySource.enabled', label: '保全记忆原料', component: 'Switch', bottomHelpMessage: '独立于整理、注入和模型配置；关闭停止新采集，不删除已保全数据' },
-  { field: 'memorySource.groups', label: '保全原料的群', component: 'GTags', componentProps: { allowAdd: true, allowDel: true }, bottomHelpMessage: '未配置时沿用 promptCache.groups；显式空列表不采集任何群' },
+  { field: 'memoryV3.enabled', label: '长期记忆总开关', component: 'Switch', bottomHelpMessage: '关掉只是暂停（整理和聊天带记忆都停），已经记下的东西不删，随时再开' },
+  { field: 'memoryV3.groups', label: '启用记忆的群', component: 'GTags', componentProps: { allowAdd: true, allowDel: true }, bottomHelpMessage: '填要让哈基米动用长期记忆的群号，#整理记忆 和聊天时带记忆都只对这些群生效。不填 = 跟下面「保全原料的群」保持一致；想全关就把群号都删掉保存' },
+  { field: 'memoryV3.organizeEnabled', label: '允许 #整理记忆 命令', component: 'Switch', bottomHelpMessage: '关掉后命令发了也不干活；攒下的聊天原文不受影响' },
+  { field: 'memoryV3.injectEnabled', label: '聊天时带记忆', component: 'Switch', bottomHelpMessage: '把记下的成员情况和群里的大事带给哈基米参考，只在当轮生效，不会塞进聊天记录' },
+  { field: 'memoryV3.reclaimEnabled', label: '整理完删原件省空间', component: 'Switch', bottomHelpMessage: '整理成功后的消息原件删掉省空间（证据会留底，没整理过的绝不删）。拿不准就开着' },
+  { field: 'memoryV3.coreTokens', label: '固定记忆体积上限', component: 'InputNumber', componentProps: { min: 64, max: 16000 }, bottomHelpMessage: '每轮聊天都带的「固定记忆」的体积上限，超了会在 #记忆状态 里提醒你删几条不重要的，不会偷偷截断' },
+  { field: 'memorySource.enabled', label: '悄悄备份聊天原文', component: 'Switch', bottomHelpMessage: '每条群消息的原文自动备份一份给记忆用，只是备份不影响任何功能；关掉只停新备份，已备份的不删' },
+  { field: 'memorySource.groups', label: '备份原文的群', component: 'GTags', componentProps: { allowAdd: true, allowDel: true }, bottomHelpMessage: '不填 = 跟「启用省钱的群」一致；一个都不想备份就清空保存' },
   ...legacyFields.map(field => ({ ...field, label: field.field ? `${field.label}（旧字段）` : '旧记忆兼容配置', bottomHelpMessage: '兼容保留；V3不使用此字段，旧自动提取和旧召回已退役' }))
 ]
