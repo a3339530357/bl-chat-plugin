@@ -209,11 +209,11 @@ export class MemoryStoreV3 {
       const observed = support.map(({ row }) => row.sentAt).filter(Boolean).sort().at(-1) || null
       const same = existing && (item.type === 'fact' ? memoryHash(existing.value) === memoryHash(item.value) : existing.lifecycle === item.lifecycle && existing.text === item.text)
       let reason = item.decision !== 'accept' ? 'ambiguous' : null
-      if (item.type === 'fact' && (item.basis !== 'self_report' || support.some(({ row }) => row.senderId !== item.subjectId || row.fidelity !== 'original' || row.replyToMessageId))) reason = 'subject_or_source_uncertain'
+      if (item.type === 'fact' && item.kind !== 'style' && (item.basis !== 'self_report' || support.some(({ row }) => row.senderId !== item.subjectId || row.fidelity !== 'original' || row.replyToMessageId))) reason = 'subject_or_source_uncertain'
       if (support.some(({ row }) => row.fidelity !== 'original' || !row.senderId)) reason = 'legacy_source_uncertain'
       const knownPeople = new Set([...allRows.flatMap(row => [row.senderId, ...(row.mentions || [])]), ...Object.values(before.facts).map(row => row.subjectId), ...Object.values(before.events).flatMap(row => row.participants)])
       if (item.type === 'event' && item.participants.some(id => !knownPeople.has(id))) reason = 'participant_unverified'
-      if (support.some(({ row }) => /开玩笑|逗你|假如|假设|他说|她说|“|”/.test(row.text))) reason = 'context_uncertain'
+      if (item.kind !== 'style' && support.some(({ row }) => /开玩笑|逗你|假如|假设|他说|她说|“|”/.test(row.text))) reason = 'context_uncertain'
       if (item.targetId && !existing) reason = 'unknown_target'
       if (existing && item.type === 'fact' && (existing.subjectId !== item.subjectId || existing.slot !== item.slot)) reason = 'target_mismatch'
       if (existing && item.type === 'event' && (existing.title !== item.title || existing.time?.start !== item.time?.start || !existing.participants.some(id => item.participants.includes(id)))) reason = 'event_identity_uncertain'

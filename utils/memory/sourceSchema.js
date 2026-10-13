@@ -4,10 +4,10 @@ export const MEMORY_SCHEMA_VERSION = 1
 export const MEMORY_PREFIX = 'ytbot:memory:v3:'
 export const SOURCE_PAGE_LIMIT = 64
 export const SOURCE_KINDS = Object.freeze(['member_message', 'bot_message', 'legacy_message'])
-export const FACT_KINDS = Object.freeze(['identity', 'preference', 'habit'])
+export const FACT_KINDS = Object.freeze(['identity', 'preference', 'habit', 'style'])
 export const FACT_STATUSES = Object.freeze(['active', 'disputed', 'superseded', 'retracted', 'rejected'])
 export const EVENT_LIFECYCLES = Object.freeze(['planned', 'occurred', 'cancelled', 'unknown'])
-export const FACT_SLOTS = Object.freeze({ birthday: 'single', residence: 'single', occupation: 'multiple', preference: 'per_target', habit: 'per_target' })
+export const FACT_SLOTS = Object.freeze({ birthday: 'single', residence: 'single', occupation: 'multiple', preference: 'per_target', habit: 'per_target', style: 'per_target' })
 
 export function memoryScope(botId, groupId) {
   if (botId == null || groupId == null || !String(botId) || !String(groupId)) throw new Error('memory_scope_required')

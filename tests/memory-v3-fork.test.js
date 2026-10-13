@@ -126,3 +126,22 @@ test('fork model failure does not advance the cursor and can retry to success', 
   assert.equal(Object.values(state.facts).filter(item => item.status === 'active').length, 1)
   assert.equal(calls, 2)
 })
+
+test('style observations need multi-message evidence and land as per-target slots', async () => {
+  const env = await environment(forkModel([
+    { type: 'fact', subjectId: '101', kind: 'style', slot: 'style:tone', value: '阴阳怪气但心肠好', text: '说话风格：阴阳怪气但心肠好', basis: 'observed', decision: 'accept',
+      evidence: [{ quote: '谁他妈的薅了' }, { quote: '你个猪mer' }] },
+    { type: 'fact', subjectId: '101', kind: 'style', slot: 'style:口头禅', value: '魔了', text: '说话风格：口头禅是「魔了」', basis: 'observed', decision: 'accept',
+      evidence: [{ quote: '魔了' }] }
+  ]))
+  await env.add('m1', '谁他妈的薅了')
+  await env.add('m2', '你个猪mer')
+  await env.add('m3', '魔了')
+  await env.commitTurn([`message:bot:${env.scope.groupId}:m3`])
+  await env.service.start(env.scope)
+  await drain(env.service)
+  const state = await env.store.snapshot(env.scope)
+  const styles = Object.values(state.facts).filter(item => item.status === 'active' && item.kind === 'style')
+  assert.equal(styles.length, 1, '两条 quote 的入库，单条 quote 的被拒')
+  assert.equal(styles[0].slot, 'style:tone')
+})
