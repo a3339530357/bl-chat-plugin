@@ -169,6 +169,7 @@ export class MemoryStoreV3 {
       if (existing && item.type === 'event' && (existing.title !== item.title || existing.time?.start !== item.time?.start || !existing.participants.some(id => item.participants.includes(id)))) reason = 'event_identity_uncertain'
       if (existing && !same && (!['replace', 'retract'].includes(item.action) || item.changeKind !== 'correction' && item.changeKind !== 'change' || !item.verified)) reason = 'conflict'
       if (existing && !same && (!observed || observed < existing.lastSupportedAt)) reason = 'older_evidence'
+      if (existing?.basis === 'master_confirmed' && !same && (!observed || observed <= new Date(existing.updatedAt).toISOString())) reason = 'master_revision_newer'
       if (after.tombstones[slot] || after.tombstones[fingerprint]) reason = 'previously_removed'
       const value = { ...item, id: existing?.id || `${item.type}_${randomUUID()}`, evidence: undefined, evidenceIds: unique([...(existing?.evidenceIds || []), ...evidenceIds]),
         fingerprint, slotKey: slot, firstObservedAt: existing?.firstObservedAt || observed, lastSupportedAt: observed,

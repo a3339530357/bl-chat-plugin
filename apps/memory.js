@@ -20,6 +20,8 @@ export class MemoryCommands extends plugin {
       event: "message",
       priority: 9998,
       rule: [
+        { reg: "^#整理记忆$", fnc: "organizeV3", permission: "master" },
+        { reg: "^#整理记忆进度$", fnc: "organizeV3Status", permission: "master" },
         { reg: "^#记忆(待确认|证据|确认|驳回|修正|撤销修订|删除条目)(?:\\s+[\\s\\S]+)?$", fnc: "manageV3", permission: "master" },
         { reg: "^#记忆状态$", fnc: "memoryStatus" },
         { reg: "^#我的记忆$", fnc: "listMyMemory" },
@@ -37,6 +39,29 @@ export class MemoryCommands extends plugin {
 
   get memoryManager() {
     return getSharedState()?.memoryManager
+  }
+
+  async organizeV3(e) {
+    if (!e.isMaster || !e.group_id) { await e.reply('请由主人在目标群使用此命令'); return true }
+    try {
+      const service = getSharedState()?.memoryService
+      if (!service) throw new Error('memory_service_unavailable')
+      const result = await service.start(service.store.scope(botIdForEvent(e), e.group_id))
+      await e.reply(result.empty ? '没有新的待整理原料' : `记忆整理任务：${result.job.id}\n本次截止序号：${result.job.target}，后台执行，可用 #整理记忆进度 查看`)
+    } catch (error) { await e.reply(`无法启动整理：${error.message}`) }
+    return true
+  }
+
+  async organizeV3Status(e) {
+    if (!e.isMaster || !e.group_id) return true
+    try {
+      const service = getSharedState()?.memoryService
+      const scope = service.store.scope(botIdForEvent(e), e.group_id)
+      const { job } = await service.jobs.get(scope)
+      const state = await service.store.snapshot(scope)
+      await e.reply(`整理进度：${state.meta.extractedThrough || 0}\n${job ? `任务 ${job.id}：${job.status}，截止 ${job.target}，已提交 ${job.batches} 批${job.lastError ? `，最近错误 ${job.lastError}` : ''}` : '当前没有待执行任务'}`)
+    } catch (error) { await e.reply(`读取整理进度失败：${error.message}`) }
+    return true
   }
 
   async manageV3(e) {

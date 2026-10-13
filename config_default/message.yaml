@@ -256,6 +256,18 @@ pluginSettings:
       mentioned: 0.05
   # 原料采集独立于 memorySystem/模型开关；groups 未设置时沿用 promptCache.groups。
   # 未整理原料不设 TTL、不按容量裁剪；以下阈值只用于积压提醒。
+  memoryV3:
+    enabled: true
+    organizeEnabled: true
+    injectEnabled: true
+    batchMessages: 24
+    batchTokens: 8192
+    timeoutMs: 90000
+    maxAttempts: 3
+    retryDelayMs: 1000
+    coreTokens: 4000
+    eventTokens: 1600
+    reclaimEnabled: false
   memorySource:
     enabled: true
     remindMessages: 10000

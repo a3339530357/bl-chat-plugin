@@ -1,5 +1,6 @@
 import { EmotionManager } from "../utils/EmotionManager.js"
 import { MemoryManager } from "../utils/MemoryManager.js"
+import { MemoryService } from "../utils/memory/MemoryService.js"
 import { ExpressionLearner } from "../utils/ExpressionLearner.js"
 import KnowledgeSearcher from "../functions/KnowledgeSearcher.js"
 import KnowledgeExpander from "../functions/KnowledgeExpander.js"
@@ -81,6 +82,8 @@ export function initializeSharedState(config) {
       }
     })
     sharedState.memoryManager.updateConfig(buildMemoryConfig(config))
+    sharedState.memoryService.updateConfig(config)
+    sharedState.memoryService.resumeAll().catch(error => logger.error(`[MemoryV3] 恢复任务失败: ${error.message}`))
     Object.assign(sharedState.expressionLearner.config, {
       ...config.expressionLearning || {},
       memoryAiConfig: config.memoryAiConfig || null
@@ -122,6 +125,7 @@ export function initializeSharedState(config) {
     emotionManager: new EmotionManager(config.emotionSystem || {}),
     // 长期记忆
     memoryManager: new MemoryManager(buildMemoryConfig(config)),
+    memoryService: new MemoryService(config),
     // 表达学习
     expressionLearner: new ExpressionLearner({
       ...config.expressionLearning || {},
@@ -142,6 +146,8 @@ export function initializeSharedState(config) {
   }
 
   sharedState.messageManager.promptCacheConfig = config
+  sharedState.memoryStoreV3 = sharedState.memoryService.store
+  sharedState.memoryService.resumeAll().catch(error => logger.error(`[MemoryV3] 恢复任务失败: ${error.message}`))
   applyToolRegistrySnapshot(sharedState)
   refreshLocalTools(sharedState, { force: true }).catch(error => {
     logger.error('[LocalToolRegistry] 初始化自定义工具失败:', error)

@@ -6,6 +6,7 @@ import { redisFixture } from './helpers/redis-fixture.js'
 import { memorySourceStore } from '../utils/memory/MemorySourceStore.js'
 import { buildMemorySource } from '../utils/memory/sourceSchema.js'
 import { MemoryStoreV3 } from '../utils/memory/MemoryStoreV3.js'
+import { MemoryService } from '../utils/memory/MemoryService.js'
 
 register('./helpers/memory-command-loader.mjs', import.meta.url)
 globalThis.plugin = class {}
@@ -63,4 +64,25 @@ test('V3 review commands require master in the target group and support evidence
   assert.equal((await store.snapshot(scope)).facts[factId].value, false)
   await command.manageV3(event(`#记忆撤销修订 ${factId}`))
   assert.equal((await store.snapshot(scope)).facts[factId].value, true)
+})
+
+test('#整理记忆 returns its persistent job before the fake model finishes and rejects non-master', async () => {
+  const store = new MemoryStoreV3(fixture.client)
+  const group = randomUUID()
+  const scope = store.scope('bot', group)
+  await store.sources.record(scope, buildMemorySource({ message_id: 'one', user_id: '101', msg: '普通聊天' }, scope))
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const service = new MemoryService({ memoryV3: { groups: [group] } }, { store, model: async () => { await gate; return '{"complete":true,"candidates":[]}' } })
+  globalThis.memoryCommandState = { memoryService: service }
+  const replies = []
+  const event = { self_id: 'bot', group_id: group, user_id: 'master', reply: text => replies.push(text) }
+  await new MemoryCommands().organizeV3(event)
+  assert.equal((await service.jobs.get(scope)).job, null)
+  try {
+    await new MemoryCommands().organizeV3({ ...event, isMaster: true })
+    assert.match(replies.at(-1), /后台执行/)
+    assert.equal((await store.snapshot(scope)).meta.extractedThrough, '0')
+  } finally { release(); await Promise.all(service.running.values()) }
+  assert.equal((await store.snapshot(scope)).meta.extractedThrough, '1')
 })
