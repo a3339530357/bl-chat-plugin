@@ -157,21 +157,29 @@ ${JSON.stringify(existing) || '无'}`
     if (!Array.isArray(value.candidates) || value.candidates.length > 200) throw new Error('memory_model_schema')
     const candidates = []
     for (const candidate of value.candidates) {
-      // 模型只给 quote；本地对待整理区原件反查证据行（eventId/归属以原件为准）
-      const quotes = (candidate?.evidence || []).map(ref => ref?.quote).filter(quote => typeof quote === 'string' && quote.length >= 2)
+      // 模型只给 quote；本地对待整理区原件反查证据行。同一 quote 可能命中多条消息
+      // （含不同人的发言与否定句）：收集全部匹配行，归属有歧义时降级待确认而非硬选第一条。
+      const quotes = [...new Set((candidate?.evidence || []).map(ref => ref?.quote).filter(quote => typeof quote === 'string' && quote.length >= 2))]
       const matched = []
+      let unmatchedQuotes = 0
       for (const quote of quotes) {
-        const row = sources.find(item => item.text.includes(quote))
-        if (row && !matched.some(({ quote: seen }) => seen === quote)) matched.push({ quote, row })
+        const rows = sources.filter(item => item.text.includes(quote))
+        if (!rows.length) { unmatchedQuotes++; continue }
+        for (const row of rows) matched.push({ quote, row })
       }
       if (!matched.length) { candidates.push({ ...candidate, rejectedReason: 'candidate_fork_evidence' }); continue }
-      // 风格归纳需要多条独立消息支撑：单条 quote 不足以刻画说话方式，降级待确认
+      const senders = [...new Set(matched.map(({ row }) => String(row.senderId)))]
+      const ambiguous = senders.length > 1
+      // 风格归纳需要多条独立消息支撑：单条 quote 不足以刻画说话方式
       if (candidate.type === 'fact' && candidate.kind === 'style' && new Set(matched.map(({ row }) => row.eventId)).size < 2) {
         candidates.push({ ...candidate, rejectedReason: 'candidate_style_thin_evidence' }); continue
       }
-      // 身份以证据行原件为准：自述类事实的主体就是说话人，覆盖模型自报值
+      // 身份以证据行原件为准；quote 命中多人的发言（含否定句串人）或有引用无法定位时，
+      // 不自动确信——保留候选但降级待确认
       const item = { ...candidate, evidence: matched.map(({ quote, row }) => ({ eventId: row.eventId, quote })),
-        ...(candidate.type === 'fact' ? { subjectId: String(matched[0].row.senderId) } : {}), verified: true, verificationReason: 'fork_local_source_check' }
+        ...(candidate.type === 'fact' && !ambiguous ? { subjectId: senders[0] } : {}),
+        verified: !ambiguous && unmatchedQuotes === 0, verificationReason: ambiguous ? 'fork_ambiguous_quote_owners' : unmatchedQuotes ? 'fork_partial_quotes' : 'fork_local_source_check' }
+      if (ambiguous || unmatchedQuotes) item.decision = 'review'
       if (item.slot === 'birthday') {
         const joined = quotes.join(' ')
         if (item.value?.calendar === 'solar' && !/公历|阳历/.test(joined) || item.value?.calendar === 'lunar' && !/农历|阴历/.test(joined)) item.decision = 'review'
@@ -179,6 +187,23 @@ ${JSON.stringify(existing) || '无'}`
       }
       if (item.decision !== 'accept') item.decision = 'review'
       candidates.push(item)
+    }
+    // 语义支持审核（生产路径）：本地只能证明「引用存在」，证不了「结论被原文支持」——
+    // 「我喜欢咖啡」撑不起「是厨师」。接受的候选再过一次轻量审核（memoryAiConfig 的
+    // flash，输入只有候选与原文摘录，成本可忽略）。注入假模型的测试跳过本层。
+    if (!model && candidates.some(item => !item.rejectedReason && item.decision === 'accept' && item.verified)) {
+      const route = { ...this.config.memoryAiConfig }
+      const input = { sources: sources.map(row => ({ eventId: row.eventId, senderId: row.senderId, senderNameAtTime: row.senderNameAtTime,
+        sentAt: row.sentAt, text: String(row.text || '').slice(0, 500) })), candidates: value.candidates }
+      const verified = await this.request([{ role: 'system', content: VERIFY_PROMPT }, { role: 'user', content: JSON.stringify(input) }], signal, route)
+      if (!Array.isArray(verified.verdicts) || verified.verdicts.length !== value.candidates.length) throw new Error('memory_verifier_schema')
+      for (const [index, verdict] of verified.verdicts.entries()) {
+        const item = candidates[index]
+        if (!item || item.rejectedReason || !item.decision) continue
+        if (verdict?.decision === 'unsupported') { item.rejectedReason = 'verifier_unsupported'; continue }
+        if (verdict?.decision === 'ambiguous') item.decision = 'review'
+        item.verificationReason = String(verdict?.reason || item.verificationReason).slice(0, 500)
+      }
     }
     return { candidates, audit: { extractor: 'fork', model: chat.chatApiModel, prefixRows: prefixRows.length, candidateCount: value.candidates.length, candidates: value.candidates, verdicts: [] } }
   }

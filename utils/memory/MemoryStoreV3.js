@@ -153,6 +153,14 @@ export class MemoryStoreV3 {
     })
     if (!support.some(({ row }) => row.memorySeq >= from && row.memorySeq <= to)) throw new Error('candidate_context_only')
     if (candidate.type === 'fact' && (!text(candidate.subjectId, 64) || !text(candidate.slot, 100) || !FACT_KINDS.includes(candidate.kind) || candidate.value === undefined)) throw new Error('candidate_fact')
+    // style 是 fact 专属的观察类型：event 不许冒用；槽位必须 style: 前缀；
+    // 证据须 ≥2 条独立消息且全部出自同一主体本人（跨作者发言不能拼成一个人的风格）
+    if (candidate.kind === 'style' && candidate.type !== 'fact') throw new Error('candidate_style_type')
+    if (candidate.type === 'fact' && candidate.kind === 'style') {
+      if (!candidate.slot.startsWith('style:')) throw new Error('candidate_style_slot')
+      if (new Set(support.map(({ row }) => row.eventId)).size < 2) throw new Error('candidate_style_thin')
+      if (new Set(support.map(({ row }) => String(row.senderId))).size !== 1 || String(support[0].row.senderId) !== String(candidate.subjectId)) throw new Error('candidate_style_subject')
+    }
     if (candidate.type === 'fact' && candidate.slot === 'birthday') {
       const value = candidate.value
       if (!value || typeof value !== 'object' || !['solar', 'lunar', 'unknown'].includes(value.calendar) ||
@@ -173,12 +181,14 @@ export class MemoryStoreV3 {
     return support
   }
 
-  async planBatch(scope, { from, to, candidates = [], token = null, extractorVersion = 'v3.1', audit = null }) {
+  async planBatch(scope, { from, to, candidates = [], token = null, extractorVersion = 'v3.1', audit = null, forkSources = null }) {
     if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 1 || to < from || to - from >= 64 || !Array.isArray(candidates) || candidates.length > 100) throw new Error('memory_batch_invalid')
     const before = await this.snapshot(scope, { mode: 'planning' })
     const input = await this.sourceRows(scope, from, to)
     const context = JSON.parse(before.meta.contextTail || '[]')
-    const allRows = [...context.filter(row => row.memorySeq < from), ...input.rows]
+    // fork 跨窗证据：候选已在提取层对全量快照校验过归属，窗口切分不该把
+    // 证据查找范围缩到「本窗+contextTail」——forkSources 提供本次 fork 的完整来源行
+    const allRows = forkSources ? [...forkSources] : [...context.filter(row => row.memorySeq < from), ...input.rows]
     const batchId = 'batch_' + memoryHash([scope.botId, scope.groupId, from, to, input.encoded, extractorVersion])
     const after = clone(before)
     const counts = { accepted: 0, review: 0, rejected: 0 }
@@ -213,7 +223,7 @@ export class MemoryStoreV3 {
       if (support.some(({ row }) => row.fidelity !== 'original' || !row.senderId)) reason = 'legacy_source_uncertain'
       const knownPeople = new Set([...allRows.flatMap(row => [row.senderId, ...(row.mentions || [])]), ...Object.values(before.facts).map(row => row.subjectId), ...Object.values(before.events).flatMap(row => row.participants)])
       if (item.type === 'event' && item.participants.some(id => !knownPeople.has(id))) reason = 'participant_unverified'
-      if (item.kind !== 'style' && support.some(({ row }) => /开玩笑|逗你|假如|假设|他说|她说|“|”/.test(row.text))) reason = 'context_uncertain'
+      if (!(item.type === 'fact' && item.kind === 'style') && support.some(({ row }) => /开玩笑|逗你|假如|假设|他说|她说|“|”/.test(row.text))) reason = 'context_uncertain'
       if (item.targetId && !existing) reason = 'unknown_target'
       if (existing && item.type === 'fact' && (existing.subjectId !== item.subjectId || existing.slot !== item.slot)) reason = 'target_mismatch'
       if (existing && item.type === 'event' && (existing.title !== item.title || existing.time?.start !== item.time?.start || !existing.participants.some(id => item.participants.includes(id)))) reason = 'event_identity_uncertain'

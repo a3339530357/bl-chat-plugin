@@ -72,22 +72,38 @@ test('fork prefix is built from the ledger header and replay rows with the instr
   assert.equal((await env.store.snapshot(env.scope)).meta.extractedThrough, String(1))
 })
 
-test('fork candidates with fabricated quotes are rejected and subjects are pinned to the evidence row sender', async () => {
+test('fork candidates with fabricated or ambiguous quotes never land as verified active facts', async () => {
   const env = await environment(forkModel([
     { type: 'fact', subjectId: '101', kind: 'preference', slot: 'preference:tea', value: true, text: '喜欢喝茶', basis: 'self_report', decision: 'accept',
       evidence: [{ quote: '这句话根本不存在于任何消息里' }] },
-    { type: 'fact', subjectId: '202', kind: 'identity', slot: 'job', value: '厨师', text: '是厨师', basis: 'self_report', decision: 'accept',
-      evidence: [{ quote: '我喜欢咖啡' }] }
+    { type: 'fact', subjectId: '101', kind: 'identity', slot: 'job', value: '厨师', text: '是厨师', basis: 'self_report', decision: 'accept',
+      evidence: [{ quote: '我喜欢咖啡' }, { quote: '我是厨师也爱烘焙' }] }
   ]))
   const source = await env.add('m1', '我喜欢咖啡')
   await env.commitTurn([source.eventId])
   await env.service.start(env.scope)
   await drain(env.service)
   const state = await env.store.snapshot(env.scope)
-  const facts = Object.values(state.facts).filter(item => item.status === 'active')
-  assert.equal(facts.length, 1, '伪造 quote 的拒绝；错报 subjectId 的以证据行说话人为准')
-  assert.equal(facts[0].subjectId, '101', 'subjectId 被原件 senderId 覆盖，不吃模型自报')
+  const active = Object.values(state.facts).filter(item => item.status === 'active')
+  assert.equal(active.length, 0, '纯伪造 quote 拒绝；存在 quote 但混入无法定位引用的降级 review，不自动确信')
   assert.equal(state.meta.extractedThrough, String(1), '处理完成游标推进')
+})
+
+test('quote hitting multiple peoples messages stays ambiguous instead of misattribution', async () => {
+  const env = await environment(forkModel([
+    { type: 'fact', subjectId: '202', kind: 'preference', slot: 'preference:coffee', value: true, text: '喜欢咖啡', basis: 'self_report', decision: 'accept',
+      evidence: [{ quote: '喜欢咖啡' }] }
+  ]))
+  await env.add('m1', '我不喜欢咖啡，绝对不喝', '101')
+  await env.add('m2', '我喜欢咖啡，尤其喜欢美式', '202')
+  await env.commitTurn([`message:bot:${env.scope.groupId}:m2`])
+  await env.service.start(env.scope)
+  await drain(env.service)
+  const state = await env.store.snapshot(env.scope)
+  const active = Object.values(state.facts).filter(item => item.status === 'active')
+  assert.equal(active.length, 0, 'quote 命中否定句与他人发言：歧义降级，不得把 202 的喜好记到 101 头上')
+  const pending = Object.values(state.review)
+  assert.ok(pending.length >= 1, '歧义候选保留待确认')
 })
 
 test('fork splits large ranges into 64-row windows and attributes candidates by evidence', async () => {
@@ -144,4 +160,18 @@ test('style observations need multi-message evidence and land as per-target slot
   const styles = Object.values(state.facts).filter(item => item.status === 'active' && item.kind === 'style')
   assert.equal(styles.length, 1, '两条 quote 的入库，单条 quote 的被拒')
   assert.equal(styles[0].slot, 'style:tone')
+})
+
+test('window overflowing 100 candidates fails loudly instead of silently dropping', async () => {
+  const env = await environment(forkModel(
+    Array.from({ length: 101 }, (_, index) => ({ type: 'fact', subjectId: '101', kind: 'identity', slot: `job:${index}`, value: `职业${index}`, text: `是职业${index}`, basis: 'self_report', decision: 'accept', evidence: [{ quote: '我喜欢咖啡' }] }))
+  ))
+  const source = await env.add('m1', '我喜欢咖啡')
+  await env.commitTurn([source.eventId])
+  const job = await env.service.start(env.scope)
+  await drain(env.service)
+  const finished = await env.service.jobs.get(env.scope, job.job.id)
+  assert.equal(finished.job.status, 'failed')
+  assert.ok(finished.job.lastError.includes('memory_candidates_overflow'), '显式失败并保留原因')
+  assert.equal((await env.store.snapshot(env.scope)).meta.extractedThrough, '0', '游标不动，原料保留')
 })

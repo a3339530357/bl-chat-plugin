@@ -142,8 +142,17 @@ export class MemoryService {
   async runForkAll(scope, job, token, state, leaseMs) {
     const settings = memoryV3Settings(this.config)
     const after = Number(state.meta.extractedThrough || 0)
-    const page = await this.store.sources.readSourceRange(scope, { after, until: job.target, limit: 10000 })
-    if (!page.rows.length) throw new Error('memory_source_gap')
+    // readSourceRange 单页上限 64：循环翻页直到 target，保证「一次模型调用」看到全量原料
+    const rows = []
+    let pageAfter = after
+    for (;;) {
+      const page = await this.store.sources.readSourceRange(scope, { after: pageAfter, until: job.target, limit: 64 })
+      if (!page.rows.length) break
+      rows.push(...page.rows)
+      pageAfter = page.rows.at(-1).memorySeq
+      if (pageAfter >= job.target || page.rows.length < 64) break
+    }
+    if (!rows.length) throw new Error('memory_source_gap')
     const existing = { facts: [], events: [] }
     let auxiliaryTokens = 0
     for (const item of [...Object.values(state.facts).filter(row => row.status === 'active'),
@@ -157,16 +166,17 @@ export class MemoryService {
     const prefixRows = await this.buildForkPrefix(scope.botId, scope.groupId)
     let output = null
     let attempts = 0
+    let retries = 0
     while (!output) {
       attempts++
-      try { output = await this.requestFork(scope, prefixRows, existing, page.rows) }
+      try { output = await this.requestFork(scope, prefixRows, existing, rows) }
       catch (error) {
         if (!this.enabled(scope) || attempts >= settings.maxAttempts || !/model|request|429|timeout/i.test(error.message)) throw error
-        await this.jobs.update(scope, job.id, token, { lastError: error.message, retryCount: Number(job.retryCount || 0) + 1 }, leaseMs).catch(() => {})
+        retries++
+        await this.jobs.update(scope, job.id, token, { lastError: error.message, retryCount: Number(job.retryCount || 0) + retries }, leaseMs).catch(() => {})
         await delay(Math.min(60000, settings.retryDelayMs * 2 ** (attempts - 1)))
       }
     }
-    const rows = page.rows
     const windows = []
     for (let offset = 0; offset < rows.length; offset += 64) windows.push(rows.slice(offset, offset + 64))
     const rowSeq = new Map(rows.map(row => [row.eventId, row.memorySeq]))
@@ -183,11 +193,12 @@ export class MemoryService {
     }
     for (const [index, windowRows] of windows.entries()) {
       if (!this.enabled(scope)) throw new Error('memory_organizing_disabled')
-      const overflow = Math.max(0, buckets[index].length - 100)
+      // planBatch 单窗候选上限 100：超限显式失败保留原料，不静默截断后报成功
+      if (buckets[index].length > 100) throw new Error(`memory_candidates_overflow:${buckets[index].length}`)
       const batch = { from: windowRows[0].memorySeq, to: windowRows.at(-1).memorySeq, sourceHash: memoryHash(windowRows),
         extractorVersion: 'v3.2-fork', parts: [{ messages: [], fragment: null }], nextPart: 1,
-        candidates: buckets[index].slice(0, 100), context: [], existing, forkOverflow: overflow }
-      const plan = await this.store.planBatch(scope, { ...batch, token,
+        candidates: buckets[index], context: [], existing }
+      const plan = await this.store.planBatch(scope, { ...batch, token, forkSources: rows,
         audit: { extractor: 'fork', model: this.config.chatAiConfig?.chatApiModel || 'fork', prefixRows: prefixRows.length, parts: [output.audit], splits: [] } })
       const result = await this.store.commit(scope, plan)
       const current = await this.jobs.get(scope)
@@ -196,7 +207,8 @@ export class MemoryService {
     }
   }
 
-  async buildBatch(scope, job, state) {    const settings = memoryV3Settings(this.config)
+  async buildBatch(scope, job, state) {
+    const settings = memoryV3Settings(this.config)
     const after = Number(state.meta.extractedThrough || 0)
     const page = await this.store.sources.readSourceRange(scope, { after, until: job.target, limit: settings.batchMessages })
     const rows = []
