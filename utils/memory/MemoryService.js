@@ -3,7 +3,10 @@ import { setTimeout as delay, setImmediate as yieldLoop } from 'node:timers/prom
 import { MemoryStoreV3, memoryHash } from './MemoryStoreV3.js'
 import { MemoryExtractorV3, memoryV3Settings, memoryV3Enabled } from './MemoryExtractorV3.js'
 import { MemoryJobs } from './MemoryJobs.js'
-import { tokenEstimate } from '../../core/promptCache.js'
+import { tokenEstimate, replayEventRow } from '../../core/promptCache.js'
+import { replayRows } from '../../core/replayAdapters.js'
+import { contextStore } from '../../core/contextStore.js'
+import { promptCacheSettings } from '../../core/promptCache.js'
 import { MemoryRetrieverV3 } from './MemoryRetrieverV3.js'
 import { MemoryLegacyImporter } from './MemoryLegacyImporter.js'
 
@@ -90,8 +93,110 @@ export class MemoryService {
     } finally { clearTimeout(timer); this.controllers.delete(scope.root); this.lastModelMs = Date.now() - startedAt }
   }
 
-  async buildBatch(scope, job, state) {
+  // fork 前缀：与主对话 agent 请求同源（同一账本 header/system + replayRows('agent') 投影
+  // + 未消化旁听消息渲染）。末条由 fork 指令替换本轮 user 行——前缀到旁听为止与最近一轮
+  // 主对话请求逐字节同族，上游 prompt cache 对该前缀命中，全量重读走缓存价。
+  async buildForkPrefix(botId, groupId) {
+    const store = this.contextStore || contextStore
+    const settings = promptCacheSettings(this.config)
+    const scope = await store.scope(botId, groupId, { settings })
+    let header = await store.header(scope, 'agent')
+    let projection = 'agent'
+    if (!header?.agentSystem) { header = await store.header(scope, 'dual'); projection = 'tools' }
+    const systemText = projection === 'agent' ? header?.agentSystem : header?.toolSystem
+    if (!systemText) throw new Error('memory_fork_no_header')
+    const snapshot = await store.read(scope, header, settings, 512)
+    const rows = [{ role: 'system', content: systemText },
+      ...snapshot.blocks.flatMap(block => replayRows(block, projection))]
+    for (const event of snapshot.events) {
+      const row = replayEventRow(event, scope.botId)
+      if (row) rows.push(row)
+    }
+    if (rows.length < 2) throw new Error('memory_fork_empty_ledger')
+    return rows
+  }
+
+  // fork 模型调用（超时/abort 与 flash 路径同一套 controllers 机制）
+  async requestFork(scope, prefixRows, existing, sources) {
     const settings = memoryV3Settings(this.config)
+    if (!this.enabled(scope)) throw new Error('memory_organizing_disabled')
+    const controller = new AbortController()
+    this.controllers.set(scope.root, { scope, controller })
+    const startedAt = Date.now()
+    let timer
+    try {
+      return await Promise.race([
+        this.extractor.extractFork({ prefixRows, existing, sources }, controller.signal),
+        new Promise((_, reject) => {
+          controller.signal.addEventListener('abort', () => reject(new Error('memory_request_aborted')), { once: true })
+          if (controller.signal.aborted) reject(new Error('memory_request_aborted'))
+          timer = setTimeout(() => controller.abort(), settings.timeoutMs)
+        })
+      ])
+    } finally { clearTimeout(timer); this.controllers.delete(scope.root); this.lastModelMs = Date.now() - startedAt }
+  }
+
+  // fork 路径：一次全量模型调用（吃缓存、完整语境），提交仍按 planBatch 的 64 条
+  // 窗口上限切分——候选按证据所在窗口归组，逐窗走既有 planBatch/commit 管线
+  // （validateCandidate、禁用主体、evidence 关联、幂等提交全部复用）。
+  async runForkAll(scope, job, token, state, leaseMs) {
+    const settings = memoryV3Settings(this.config)
+    const after = Number(state.meta.extractedThrough || 0)
+    const page = await this.store.sources.readSourceRange(scope, { after, until: job.target, limit: 10000 })
+    if (!page.rows.length) throw new Error('memory_source_gap')
+    const existing = { facts: [], events: [] }
+    let auxiliaryTokens = 0
+    for (const item of [...Object.values(state.facts).filter(row => row.status === 'active'),
+      ...Object.values(state.events).filter(row => row.status === 'active').slice(-80)]) {
+      const summary = { id: item.id, subjectId: item.subjectId, slot: item.slot, text: item.text, value: item.value,
+        title: item.title, time: item.time, participants: item.participants, lifecycle: item.lifecycle, revision: item.revision }
+      const size = tokenEstimate(summary)
+      if (auxiliaryTokens + size > 8192) continue
+      existing[item.type === 'fact' ? 'facts' : 'events'].push(summary); auxiliaryTokens += size
+    }
+    const prefixRows = await this.buildForkPrefix(scope.botId, scope.groupId)
+    let output = null
+    let attempts = 0
+    while (!output) {
+      attempts++
+      try { output = await this.requestFork(scope, prefixRows, existing, page.rows) }
+      catch (error) {
+        if (!this.enabled(scope) || attempts >= settings.maxAttempts || !/model|request|429|timeout/i.test(error.message)) throw error
+        await this.jobs.update(scope, job.id, token, { lastError: error.message, retryCount: Number(job.retryCount || 0) + 1 }, leaseMs).catch(() => {})
+        await delay(Math.min(60000, settings.retryDelayMs * 2 ** (attempts - 1)))
+      }
+    }
+    const rows = page.rows
+    const windows = []
+    for (let offset = 0; offset < rows.length; offset += 64) windows.push(rows.slice(offset, offset + 64))
+    const rowSeq = new Map(rows.map(row => [row.eventId, row.memorySeq]))
+    const buckets = windows.map(() => [])
+    for (const candidate of output.candidates) {
+      const seqs = (candidate.evidence || []).map(ref => rowSeq.get(ref.eventId)).filter(Number.isFinite)
+      let index = 0
+      if (seqs.length) {
+        const maxSeq = Math.max(...seqs)
+        index = windows.findIndex(window => maxSeq >= window[0].memorySeq && maxSeq <= window.at(-1).memorySeq)
+        if (index < 0) index = windows.length - 1
+      }
+      buckets[index].push(candidate)
+    }
+    for (const [index, windowRows] of windows.entries()) {
+      if (!this.enabled(scope)) throw new Error('memory_organizing_disabled')
+      const overflow = Math.max(0, buckets[index].length - 100)
+      const batch = { from: windowRows[0].memorySeq, to: windowRows.at(-1).memorySeq, sourceHash: memoryHash(windowRows),
+        extractorVersion: 'v3.2-fork', parts: [{ messages: [], fragment: null }], nextPart: 1,
+        candidates: buckets[index].slice(0, 100), context: [], existing, forkOverflow: overflow }
+      const plan = await this.store.planBatch(scope, { ...batch, token,
+        audit: { extractor: 'fork', model: this.config.chatAiConfig?.chatApiModel || 'fork', prefixRows: prefixRows.length, parts: [output.audit], splits: [] } })
+      const result = await this.store.commit(scope, plan)
+      const current = await this.jobs.get(scope)
+      job = (await this.jobs.update(scope, job.id, token, { batches: Number(current.job?.batches || 0) + 1, lastReceipt: result.batch }, leaseMs)).job
+      await yieldLoop()
+    }
+  }
+
+  async buildBatch(scope, job, state) {    const settings = memoryV3Settings(this.config)
     const after = Number(state.meta.extractedThrough || 0)
     const page = await this.store.sources.readSourceRange(scope, { after, until: job.target, limit: settings.batchMessages })
     const rows = []
@@ -177,6 +282,11 @@ export class MemoryService {
         }
         let batch = job.batch
         if (!batch || batch.to <= Number(state.meta.extractedThrough || 0)) {
+          if (memoryV3Settings(this.config).extractor === 'fork') {
+            // fork：一次全量模型调用 + 窗口化提交；完成后回顶复核游标
+            await this.runForkAll(scope, job, token, state, leaseMs)
+            continue
+          }
           batch = await this.buildBatch(scope, job, state)
           job = (await this.jobs.update(scope, id, token, { batch, attempts: 0 }, leaseMs)).job
         }

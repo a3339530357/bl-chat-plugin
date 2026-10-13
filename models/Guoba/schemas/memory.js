@@ -105,6 +105,10 @@ const legacyFields = [
 export default [
   { component: 'SOFT_GROUP_BEGIN', label: '长期记忆 V3' },
   { field: 'memoryV3.enabled', label: '长期记忆总开关', component: 'Switch', bottomHelpMessage: '关掉只是暂停（整理和聊天带记忆都停），已经记下的东西不删，随时再开' },
+  { field: 'memoryV3.extractor', label: '整理时怎么看聊天', component: 'Select', componentProps: { options: [
+    { label: '复刻整段对话让主模型看（推荐）', value: 'fork' },
+    { label: '旧方式：小模型分小批看原文', value: 'flash' }
+  ] }, bottomHelpMessage: 'fork = 把哈基米平时看到的完整聊天记录（含系统提示）原样再给一次主对话模型，末尾追加提取指令——和聊天共用同一段缓存，全量重读很便宜，语境也最完整。flash = 旧方式，用便宜小模型分批看消息原文' },
   { field: 'memoryV3.groups', label: '启用记忆的群', component: 'GTags', componentProps: { allowAdd: true, allowDel: true }, bottomHelpMessage: '填要让哈基米动用长期记忆的群号，#整理记忆 和聊天时带记忆都只对这些群生效。不填 = 跟下面「保全原料的群」保持一致；想全关就把群号都删掉保存' },
   { field: 'memoryV3.organizeEnabled', label: '允许 #整理记忆 命令', component: 'Switch', bottomHelpMessage: '关掉后命令发了也不干活；攒下的聊天原文不受影响' },
   { field: 'memoryV3.injectEnabled', label: '聊天时带记忆', component: 'Switch', bottomHelpMessage: '把记下的成员情况和群里的大事带给哈基米参考，只在当轮生效，不会塞进聊天记录' },

@@ -258,6 +258,7 @@ pluginSettings:
   # 未整理原料不设 TTL、不按容量裁剪；以下阈值只用于积压提醒。
   memoryV3:
     enabled: true
+    extractor: fork
     organizeEnabled: true
     injectEnabled: true
     batchMessages: 24

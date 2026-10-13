@@ -22,7 +22,7 @@ function fakeModel(messages) {
 async function environment(model = fakeModel, options = {}) {
   const store = new MemoryStoreV3(fixture.client)
   const scope = store.scope('bot', randomUUID())
-  const config = { memoryV3: { groups: [scope.groupId], batchMessages: 2, batchTokens: 1024, timeoutMs: 10000, retryDelayMs: 1, ...options }, memoryAiConfig: { memoryAiModel: 'fake' } }
+  const config = { memoryV3: { groups: [scope.groupId], extractor: 'flash', batchMessages: 2, batchTokens: 1024, timeoutMs: 10000, retryDelayMs: 1, ...options }, memoryAiConfig: { memoryAiModel: 'fake' } }
   const service = new MemoryService(config, { store, model })
   const add = async (id, text = '我喜欢咖啡') => {
     const source = buildMemorySource({ message_id: id, user_id: '101', time: 1800000000, message: [{ type: 'text', text }] }, scope)

@@ -16,7 +16,7 @@ after(async () => { globalThis.fetch = originalFetch; await fixture?.stop() })
 async function environment(options = {}) {
   const store = new MemoryStoreV3(fixture.client)
   const scope = store.scope('bot', randomUUID())
-  const config = { memoryV3: { groups: [scope.groupId], batchMessages: 1, timeoutMs: 10000, ...options } }
+  const config = { memoryV3: { groups: [scope.groupId], extractor: 'flash', batchMessages: 1, timeoutMs: 10000, ...options } }
   const add = async (id, text, userId = '101') => {
     const message = { message_id: id, time: 1800000000 + Number(id || 0), user_id: userId, sender: { user_id: userId, nickname: userId }, message: [{ type: 'text', text }] }
     const source = buildMemorySource(message, scope)

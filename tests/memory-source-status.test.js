@@ -73,7 +73,7 @@ test('#整理记忆 returns its persistent job before the fake model finishes an
   await store.sources.record(scope, buildMemorySource({ message_id: 'one', user_id: '101', msg: '普通聊天' }, scope))
   let release
   const gate = new Promise(resolve => { release = resolve })
-  const service = new MemoryService({ memoryV3: { groups: [group] } }, { store, model: async () => { await gate; return '{"complete":true,"candidates":[]}' } })
+  const service = new MemoryService({ memoryV3: { groups: [group], extractor: 'flash' } }, { store, model: async () => { await gate; return '{"complete":true,"candidates":[]}' } })
   globalThis.memoryCommandState = { memoryService: service }
   const replies = []
   const event = { self_id: 'bot', group_id: group, user_id: 'master', reply: text => replies.push(text) }
@@ -93,7 +93,7 @@ test('legacy command names now list, disable and forget V3 personal facts withou
   const source = buildMemorySource({ message_id: 'one', user_id: '101', message: [{ type: 'text', text: '我是程序员' }] }, scope)
   await store.sources.record(scope, source)
   await store.commit(scope, await store.planBatch(scope, { from: 1, to: 1, candidates: [{ type: 'fact', subjectId: '101', kind: 'identity', slot: 'occupation', value: '程序员', text: '我是程序员', basis: 'self_report', decision: 'accept', evidence: [{ eventId: source.eventId, quote: source.text }] }] }))
-  const service = new MemoryService({ memoryV3: { groups: [group] } }, { store, model: () => { throw new Error('must not extract') } })
+  const service = new MemoryService({ memoryV3: { groups: [group], extractor: 'flash' } }, { store, model: () => { throw new Error('must not extract') } })
   globalThis.memoryCommandState = { memoryService: service }
   const replies = []; const e = { self_id: 'bot', group_id: group, user_id: '101', reply: text => replies.push(text) }
   const commands = new MemoryCommands()
@@ -110,7 +110,7 @@ test('#导入历史记忆 is master-only, asynchronous and never invokes a model
   const store = new MemoryStoreV3(fixture.client)
   const group = randomUUID(); const scope = store.scope('bot', group)
   await fixture.client.set(`ytbot:memory:${group}:101`, JSON.stringify({ facts: ['喜欢音乐'] }))
-  const service = new MemoryService({ memoryV3: { groups: [group] } }, { store, model: () => { throw new Error('no model during import') } })
+  const service = new MemoryService({ memoryV3: { groups: [group], extractor: 'flash' } }, { store, model: () => { throw new Error('no model during import') } })
   globalThis.memoryCommandState = { memoryService: service }
   const replies = []; const event = { self_id: 'bot', group_id: group, user_id: '101', reply: text => replies.push(text) }
   const commands = new MemoryCommands()
