@@ -3,6 +3,7 @@ import common from "../../../lib/common/common.js"
 import { memorySourceStore } from "../utils/memory/MemorySourceStore.js"
 import { memorySourceStatusLines } from "../utils/memory/sourceStatus.js"
 import { botIdForEvent } from "../core/promptCache.js"
+import { memoryStoreV3 } from "../utils/memory/MemoryStoreV3.js"
 
 /**
  * 记忆管理命令插件：查看 / 搜索 / 删除 / 清空 / 启停长期记忆。
@@ -19,6 +20,7 @@ export class MemoryCommands extends plugin {
       event: "message",
       priority: 9998,
       rule: [
+        { reg: "^#记忆(待确认|证据|确认|驳回|修正|撤销修订|删除条目)(?:\\s+[\\s\\S]+)?$", fnc: "manageV3", permission: "master" },
         { reg: "^#记忆状态$", fnc: "memoryStatus" },
         { reg: "^#我的记忆$", fnc: "listMyMemory" },
         { reg: "^#群记忆$", fnc: "listGroupMemory" },
@@ -35,6 +37,29 @@ export class MemoryCommands extends plugin {
 
   get memoryManager() {
     return getSharedState()?.memoryManager
+  }
+
+  async manageV3(e) {
+    if (!e.isMaster || !e.group_id) { await e.reply("请由主人在目标群使用此命令"); return true }
+    const store = getSharedState()?.memoryStoreV3 || memoryStoreV3
+    const scope = store.scope(botIdForEvent(e), e.group_id)
+    try {
+      const [, command, id, body] = e.msg.match(/^#记忆(\S+)(?:\s+(\S+))?(?:\s+([\s\S]+))?$/) || []
+      const state = await store.snapshot(scope)
+      if (command === '待确认') {
+        const lines = Object.values(state.review).filter(item => item.status === 'pending').map(item => `${item.id}\n${item.candidate.text}\n原因：${item.reason}`)
+        await e.reply(lines.length ? lines.join('\n\n').slice(0, 12000) : '暂无待确认记忆')
+      } else if (command === '证据') {
+        const item = state.facts[id] || state.events[id] || state.review[id]
+        if (!item) throw new Error('memory_object_missing')
+        await e.reply(JSON.stringify((item.evidenceIds || []).map(key => state.evidence[key]), null, 2).slice(0, 12000))
+      } else {
+        const actions = { 确认: 'confirm', 驳回: 'reject', 修正: 'edit', 撤销修订: 'undo', 删除条目: 'delete' }
+        await store.manage(scope, { action: actions[command], id, patch: body ? JSON.parse(body) : undefined, actorId: e.user_id, isMaster: e.isMaster })
+        await e.reply('记忆已更新')
+      }
+    } catch (error) { await e.reply(`记忆操作失败：${error.message}`) }
+    return true
   }
 
   isGroupMemoryAdmin(e) {

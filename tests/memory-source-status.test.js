@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { redisFixture } from './helpers/redis-fixture.js'
 import { memorySourceStore } from '../utils/memory/MemorySourceStore.js'
 import { buildMemorySource } from '../utils/memory/sourceSchema.js'
+import { MemoryStoreV3 } from '../utils/memory/MemoryStoreV3.js'
 
 register('./helpers/memory-command-loader.mjs', import.meta.url)
 globalThis.plugin = class {}
@@ -38,4 +39,28 @@ test('#记忆状态 still returns old information if new source status is unavai
     assert.match(replies[0], /记忆系统：关闭/)
     assert.match(replies[0], /旧记忆状态如上/)
   } finally { globalThis.redis = client }
+})
+
+test('V3 review commands require master in the target group and support evidence, confirm, edit and undo', async () => {
+  const store = new MemoryStoreV3(fixture.client)
+  const group = randomUUID()
+  const scope = store.scope('bot', group)
+  const source = buildMemorySource({ message_id: 'review', user_id: '101', message: [{ type: 'text', text: '我喜欢咖啡' }] }, scope)
+  await store.sources.record(scope, source)
+  await store.commit(scope, await store.planBatch(scope, { from: 1, to: 1, candidates: [{ type: 'fact', subjectId: '101', kind: 'preference', slot: 'preference:coffee', value: true, text: '喜欢咖啡', decision: 'review', evidence: [{ eventId: source.eventId, quote: source.text }] }] }))
+  globalThis.memoryCommandState = { memoryStoreV3: store }
+  const id = Object.keys((await store.snapshot(scope)).review)[0]
+  const replies = []
+  const command = new MemoryCommands()
+  const event = msg => ({ msg, self_id: 'bot', group_id: group, user_id: 'master', isMaster: true, reply: text => replies.push(text) })
+  await command.manageV3({ ...event(`#记忆确认 ${id}`), isMaster: false })
+  assert.equal(Object.keys((await store.snapshot(scope)).facts).length, 0)
+  await command.manageV3(event(`#记忆证据 ${id}`))
+  assert.match(replies.at(-1), /我喜欢咖啡/)
+  await command.manageV3(event(`#记忆确认 ${id}`))
+  const factId = Object.keys((await store.snapshot(scope)).facts)[0]
+  await command.manageV3(event(`#记忆修正 ${factId} {"text":"只喝无咖啡因饮料","value":false}`))
+  assert.equal((await store.snapshot(scope)).facts[factId].value, false)
+  await command.manageV3(event(`#记忆撤销修订 ${factId}`))
+  assert.equal((await store.snapshot(scope)).facts[factId].value, true)
 })

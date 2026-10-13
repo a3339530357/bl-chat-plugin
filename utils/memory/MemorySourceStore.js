@@ -16,7 +16,7 @@ local function prepareMemory(keys, payload, ledgerSeq, resetId)
   local latest = tonumber(redis.call('GET', keys[1]) or '0')
   local byteText = redis.call('HGET', keys[4], 'pendingBytes') or '0'
   local bytes = tonumber(byteText)
-  local cursor = tonumber(redis.call('HGET', keys[4], 'extractedThrough') or '0')
+  local cursor = tonumber(redis.call('HGET', keys[4], 'sourceReclaimedThrough') or '0')
   if not latest or latest < 0 or latest % 1 ~= 0 or latest >= 9007199254740990 or not bytes or bytes < 0 or bytes % 1 ~= 0 then return nil, 'memory_source_gap' end
   if byteText ~= string.format('%.0f', bytes) then return nil, 'memory_source_gap' end
   if redis.call('HLEN', keys[3]) ~= latest then return nil, 'memory_source_gap' end
@@ -61,14 +61,17 @@ return cjson.encode({untilSeq=untilSeq, rows=redis.call('ZRANGEBYSCORE', KEYS[2]
 
 const STATUS = `local meta = {}; local values = redis.call('HGETALL', KEYS[4])
 for i=1,#values,2 do meta[values[i]]=values[i+1] end
-return cjson.encode({latest=tonumber(redis.call('GET', KEYS[1]) or '0'), pending=redis.call('ZCARD', KEYS[2]), meta=meta})`
+local cursor = tonumber(meta.extractedThrough or '0')
+local first = redis.call('ZRANGEBYSCORE', KEYS[2], '(' .. cursor, '+inf', 'LIMIT', 0, 1)
+if #first > 0 then meta.oldestPendingAt = tostring(cjson.decode(cjson.decode(first[1]).payload).receivedAt or '') else meta.oldestPendingAt = '0' end
+return cjson.encode({latest=tonumber(redis.call('GET', KEYS[1]) or '0'), pending=redis.call('ZCOUNT', KEYS[2], '(' .. cursor, '+inf'), resident=redis.call('ZCARD', KEYS[2]), meta=meta})`
 
 const ERROR = `${CLOCK}
 redis.call('HSET', KEYS[1], 'lastError', ARGV[1], 'lastErrorAt', now)
 return cjson.encode({recorded=true})`
 
 const REMIND = `${CLOCK}
-local count = redis.call('ZCARD', KEYS[1])
+local count = redis.call('ZCOUNT', KEYS[1], '(' .. (redis.call('HGET', KEYS[2], 'extractedThrough') or '0'), '+inf')
 local bytes = tonumber(redis.call('HGET', KEYS[2], 'pendingBytes') or '0')
 local oldest = tonumber(redis.call('HGET', KEYS[2], 'oldestPendingAt') or now)
 local previous = tonumber(redis.call('HGET', KEYS[2], 'remindedAt') or '0')

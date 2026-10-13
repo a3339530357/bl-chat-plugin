@@ -4,7 +4,8 @@ import { memorySourceStore } from './MemorySourceStore.js'
 const checkedAt = new Map()
 
 function formatTime(value) {
-  return Number(value) ? new Date(Number(value)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '无'
+  const timestamp = Number(value) || Date.parse(value)
+  return Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) : '无'
 }
 
 export function memorySourceStatusLines(status) {
