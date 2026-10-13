@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { MemorySourceStore } from './MemorySourceStore.js'
-import { memoryScope, FACT_KINDS, EVENT_LIFECYCLES } from './sourceSchema.js'
+import { memoryScope, FACT_KINDS, FACT_SLOTS, EVENT_LIFECYCLES } from './sourceSchema.js'
 
-export const memoryHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+export const memoryHash = value => createHash('sha256').update(JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+  ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item)).digest('hex')
 const BUCKETS = ['facts', 'events', 'evidence', 'review', 'revisions', 'tombstones', 'batches']
 const GUARD = `
 for i, key in ipairs(KEYS) do
@@ -15,8 +16,13 @@ if redis.call('HEXISTS', KEYS[1], 'writePending') == 1 then return cjson.encode(
 const SNAPSHOT = `${GUARD}
 local result = {}
 for i=1,8 do
-  local bucket = {}; local values = redis.call('HGETALL', KEYS[i])
-  for n=1,#values,2 do bucket[values[n]]=values[n+1] end
+  local bucket = {}
+  if ARGV[1] == 'recall' and i == 1 then
+    for _, field in ipairs({'memoryRevision', 'disabledSubjects', 'epoch'}) do bucket[field]=redis.call('HGET', KEYS[i], field) or nil end
+  elseif (ARGV[1] ~= 'recall' or i<=3) and (ARGV[1] ~= 'planning' or i<8) then
+    local values = redis.call('HGETALL', KEYS[i])
+    for n=1,#values,2 do bucket[values[n]]=values[n+1] end
+  end
   table.insert(result, bucket)
 end
 return cjson.encode({buckets=result})`
@@ -36,6 +42,15 @@ if plan.from ~= cjson.null then
   local rows = redis.call('ZRANGEBYSCORE', KEYS[11], plan.from, plan.to)
   if #rows ~= #plan.sourceRows then return cjson.encode({error='memory_source_changed'}) end
   for i, row in ipairs(rows) do if row ~= plan.sourceRows[i] then return cjson.encode({error='memory_source_changed'}) end end
+  local byteText = redis.call('HGET', KEYS[1], 'sourcePendingBytes') or redis.call('HGET', KEYS[1], 'pendingBytes') or '0'
+  local remaining = tonumber(byteText)
+  if not remaining or byteText ~= string.format('%.0f', remaining) then return cjson.encode({error='memory_source_gap'}) end
+  for _, row in ipairs(rows) do remaining=remaining-string.len(row) end
+  if remaining < 0 then return cjson.encode({error='memory_source_gap'}) end
+  plan.remainingBytes=remaining
+  local batches=tonumber(redis.call('HGET', KEYS[1], 'committedBatchCount') or '0')
+  if not batches or batches % 1 ~= 0 then return cjson.encode({error='memory_meta_invalid'}) end
+  plan.batchCount=batches+1
 end
 for _, change in ipairs(plan.changes) do
   if change.bucket < 2 or change.bucket > 7 or type(change.id) ~= 'string' then return cjson.encode({error='memory_plan_invalid'}) end
@@ -43,6 +58,10 @@ for _, change in ipairs(plan.changes) do
 end
 for _, entry in ipairs(plan.timeline) do
   if type(entry.id) ~= 'string' or (entry.score ~= cjson.null and type(entry.score) ~= 'number') then return cjson.encode({error='memory_plan_invalid'}) end
+end
+for key, value in pairs(plan.control or {}) do
+  if key ~= 'disabledSubjects' and key ~= 'suppressedSubjects' and key ~= 'suppressedThrough' then return cjson.encode({error='memory_plan_invalid'}) end
+  if type(value) ~= 'string' then return cjson.encode({error='memory_plan_invalid'}) end
 end
 -- 运行时异常不回滚：保留 writePending，后续读/写/回收均拒绝，等待检查修复。
 redis.call('HSET', KEYS[1], 'writePending', plan.id)
@@ -55,7 +74,14 @@ for _, entry in ipairs(plan.timeline) do
   else redis.call('ZADD', KEYS[9], entry.score, entry.id) end
 end
 redis.call('HSET', KEYS[1], 'memoryRevision', revision+1, 'epoch', plan.nextEpoch)
-if plan.from ~= cjson.null then redis.call('HSET', KEYS[1], 'extractedThrough', plan.to, 'contextTail', plan.contextTail) end
+for key, value in pairs(plan.control or {}) do redis.call('HSET', KEYS[1], key, value) end
+if plan.from ~= cjson.null then
+  redis.call('HSET', KEYS[1], 'extractedThrough', plan.to, 'contextTail', plan.contextTail, 'sourcePendingBytes', plan.remainingBytes)
+  redis.call('HSET', KEYS[1], 'committedBatchCount', plan.batchCount)
+  local nextRows=redis.call('ZRANGEBYSCORE', KEYS[11], '(' .. plan.to, '+inf', 'LIMIT', 0, 1)
+  local oldest=#nextRows > 0 and (cjson.decode(nextRows[1]).capturedAt or redis.call('HGET', KEYS[1], 'oldestPendingAt')) or 0
+  redis.call('HSET', KEYS[1], 'oldestPendingAt', oldest or 0)
+end
 redis.call('HSET', KEYS[8], plan.id, plan.receipt)
 redis.call('HDEL', KEYS[1], 'writePending')
 return cjson.encode({duplicate=false, batch=plan.receipt})`
@@ -90,7 +116,7 @@ return cjson.encode({removed=#rows, through=through, done=through>=target})`
 const clone = value => JSON.parse(JSON.stringify(value))
 const unique = values => [...new Set(values)]
 const text = (value, max = 1000) => typeof value === 'string' && value.trim() && value.length <= max
-const identity = item => memoryHash([item.type, item.subjectId || '', item.slot || '', item.type === 'event' ? item.title : ''])
+const identity = item => memoryHash([item.type, item.subjectId || '', item.slot || '', item.type === 'event' ? item.title : '', FACT_SLOTS[item.slot] === 'multiple' ? item.value : null])
 
 export class MemoryStoreV3 {
   constructor(client = null) { this.sources = new MemorySourceStore(client) }
@@ -100,8 +126,8 @@ export class MemoryStoreV3 {
     return ['meta', ...BUCKETS, 'events:timeline', 'source:seq', 'source:pending'].map(key => root + key)
   }
 
-  async snapshot(scope) {
-    const { buckets } = await this.sources.evaluate(SNAPSHOT, this.keys(scope))
+  async snapshot(scope, { mode = 'full' } = {}) {
+    const { buckets } = await this.sources.evaluate(SNAPSHOT, this.keys(scope), [mode])
     const result = { meta: buckets[0] }
     BUCKETS.forEach((name, index) => { result[name] = Object.fromEntries(Object.entries(buckets[index + 1]).map(([id, value]) => [id, JSON.parse(value)])) })
     return result
@@ -127,14 +153,29 @@ export class MemoryStoreV3 {
     })
     if (!support.some(({ row }) => row.memorySeq >= from && row.memorySeq <= to)) throw new Error('candidate_context_only')
     if (candidate.type === 'fact' && (!text(candidate.subjectId, 64) || !text(candidate.slot, 100) || !FACT_KINDS.includes(candidate.kind) || candidate.value === undefined)) throw new Error('candidate_fact')
+    if (candidate.type === 'fact' && candidate.slot === 'birthday') {
+      const value = candidate.value
+      if (!value || typeof value !== 'object' || !['solar', 'lunar', 'unknown'].includes(value.calendar) ||
+          value.month != null && (!Number.isInteger(value.month) || value.month < 1 || value.month > 12) ||
+          value.day != null && (!Number.isInteger(value.day) || value.day < 1 || value.day > (value.calendar === 'lunar' ? 30 : 31)) ||
+          value.year != null && (!Number.isInteger(value.year) || value.year < 1 || value.year > 9999)) throw new Error('candidate_birthday')
+      if (value.calendar === 'solar' && value.month && value.day > new Date(Date.UTC(value.year || 2000, value.month, 0)).getUTCDate()) throw new Error('candidate_birthday')
+    }
     if (candidate.type === 'event' && (!text(candidate.title, 200) || !Array.isArray(candidate.participants) || !EVENT_LIFECYCLES.includes(candidate.lifecycle))) throw new Error('candidate_event')
-    if (candidate.type === 'event' && candidate.time?.start && !/^\d{4}(-\d{2})?(-\d{2})?$/.test(candidate.time.start)) throw new Error('candidate_time')
+    if (candidate.type === 'event' && candidate.time && !['day', 'month', 'year', 'range', 'unknown'].includes(candidate.time.precision)) throw new Error('candidate_time')
+    for (const value of candidate.type === 'event' ? [candidate.time?.start, candidate.time?.end].filter(Boolean) : []) {
+      if (!/^\d{4}(-\d{2})?(-\d{2})?$/.test(value)) throw new Error('candidate_time')
+      const date = value.length === 4 ? `${value}-01-01` : value.length === 7 ? `${value}-01` : value
+      const parsed = new Date(date + 'T00:00:00Z')
+      if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) throw new Error('candidate_time')
+    }
+    if (candidate.type === 'event' && candidate.time?.end && (!candidate.time.start || candidate.time.end < candidate.time.start)) throw new Error('candidate_time')
     return support
   }
 
   async planBatch(scope, { from, to, candidates = [], token = null, extractorVersion = 'v3.1', audit = null }) {
     if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from < 1 || to < from || to - from >= 64 || !Array.isArray(candidates) || candidates.length > 100) throw new Error('memory_batch_invalid')
-    const before = await this.snapshot(scope)
+    const before = await this.snapshot(scope, { mode: 'planning' })
     const input = await this.sourceRows(scope, from, to)
     const context = JSON.parse(before.meta.contextTail || '[]')
     const allRows = [...context.filter(row => row.memorySeq < from), ...input.rows]
@@ -143,14 +184,20 @@ export class MemoryStoreV3 {
     const counts = { accepted: 0, review: 0, rejected: 0 }
     const rejected = []
     for (const raw of candidates) {
+      if (raw?.rejectedReason) { counts.rejected++; rejected.push({ reason: String(raw.rejectedReason).slice(0, 100) }); continue }
       let support
       try { support = this.validateCandidate(raw, allRows, from, to) } catch (error) { counts.rejected++; rejected.push({ reason: error.message }); continue }
       const item = clone(raw)
+      const disabled = JSON.parse(before.meta.disabledSubjects || '{}')
+      const suppressed = JSON.parse(before.meta.suppressedSubjects || '{}')
+      if (item.type === 'fact' && disabled[item.subjectId] || support.every(({ row }) => row.memorySeq <= Math.max(Number(before.meta.suppressedThrough || 0), Number(suppressed[item.subjectId] || 0)))) {
+        counts.rejected++; rejected.push({ reason: 'memory_suppressed' }); continue
+      }
       const fingerprint = memoryHash([item.type, item.subjectId, item.slot, item.value, item.text, support.map(({ row }) => row.eventId).sort()])
       const bucket = item.type === 'fact' ? after.facts : after.events
       const slot = identity(item)
       const existing = item.targetId ? bucket[item.targetId] : Object.values(bucket).find(value => value.status === 'active' && (item.type === 'fact'
-        ? value.subjectId === item.subjectId && value.slot === item.slot
+        ? value.subjectId === item.subjectId && value.slot === item.slot && (FACT_SLOTS[item.slot] !== 'multiple' || memoryHash(value.value) === memoryHash(item.value))
         : value.title === item.title && value.time?.start && value.time.start === item.time?.start && value.participants.some(id => item.participants.includes(id))))
       const evidenceIds = support.map(({ ref, row }) => {
         const id = 'evidence_' + memoryHash([row.eventId, ref.quote])
@@ -163,6 +210,9 @@ export class MemoryStoreV3 {
       const same = existing && (item.type === 'fact' ? memoryHash(existing.value) === memoryHash(item.value) : existing.lifecycle === item.lifecycle && existing.text === item.text)
       let reason = item.decision !== 'accept' ? 'ambiguous' : null
       if (item.type === 'fact' && (item.basis !== 'self_report' || support.some(({ row }) => row.senderId !== item.subjectId || row.fidelity !== 'original' || row.replyToMessageId))) reason = 'subject_or_source_uncertain'
+      if (support.some(({ row }) => row.fidelity !== 'original' || !row.senderId)) reason = 'legacy_source_uncertain'
+      const knownPeople = new Set([...allRows.flatMap(row => [row.senderId, ...(row.mentions || [])]), ...Object.values(before.facts).map(row => row.subjectId), ...Object.values(before.events).flatMap(row => row.participants)])
+      if (item.type === 'event' && item.participants.some(id => !knownPeople.has(id))) reason = 'participant_unverified'
       if (support.some(({ row }) => /开玩笑|逗你|假如|假设|他说|她说|“|”/.test(row.text))) reason = 'context_uncertain'
       if (item.targetId && !existing) reason = 'unknown_target'
       if (existing && item.type === 'fact' && (existing.subjectId !== item.subjectId || existing.slot !== item.slot)) reason = 'target_mismatch'
@@ -175,6 +225,12 @@ export class MemoryStoreV3 {
         fingerprint, slotKey: slot, firstObservedAt: existing?.firstObservedAt || observed, lastSupportedAt: observed,
         status: item.action === 'retract' ? 'retracted' : 'active', core: item.type === 'fact' && item.core !== false,
         createdByBatch: batchId, revision: (existing?.revision || 0) + 1, updatedAt: Date.now() }
+      if (item.type === 'fact') {
+        value.aliases = unique([...(existing?.aliases || []), ...support.filter(({ row }) => row.senderId === item.subjectId).map(({ row }) => row.senderNameAtTime).filter(Boolean)])
+        value.subjectName = value.aliases.at(-1) || item.subjectId
+      } else {
+        value.participantNames = Object.fromEntries(item.participants.map(id => [id, unique([...(existing?.participantNames?.[id] || []), ...allRows.filter(row => row.senderId === id).map(row => row.senderNameAtTime)].filter(Boolean))]))
+      }
       if (reason) {
         const id = 'review_' + fingerprint
         if (!after.review[id]) after.review[id] = { id, candidate: value, reason, status: 'pending', targetId: existing?.id || null, targetRevision: existing?.revision || 0, evidenceIds, createdAt: Date.now() }
@@ -218,12 +274,14 @@ export class MemoryStoreV3 {
 
   async manage(scope, { action, id, patch, revision, actorId, isMaster }) {
     if (!isMaster || !actorId) throw new Error('memory_master_required')
-    const before = await this.snapshot(scope)
+    const before = await this.snapshot(scope, { mode: 'planning' })
     const after = clone(before)
     const review = after.review[id]
     if (['confirm', 'reject'].includes(action)) {
       if (!review || review.status !== 'pending') throw new Error('memory_review_missing')
       const value = review.candidate
+      const disabled = JSON.parse(before.meta.disabledSubjects || '{}')
+      if (action === 'confirm' && value.type === 'fact' && disabled[value.subjectId]) throw new Error('memory_subject_disabled')
       const bucket = value.type === 'fact' ? after.facts : after.events
       const current = review.targetId ? bucket[review.targetId] : null
       if ((current?.revision || 0) !== review.targetRevision) throw new Error('memory_review_stale')
@@ -258,6 +316,60 @@ export class MemoryStoreV3 {
       bucket[id].updatedBy = String(actorId)
     }
     return this.commit(scope, this.plan(before, after, { nextEpoch: Number(before.meta.epoch || 0) + 1 }))
+  }
+
+  async forget(scope, { subjectId = null, id = null, enabled, actorId, isMaster }) {
+    if (!actorId || !isMaster && (!subjectId || String(actorId) !== String(subjectId))) throw new Error('memory_permission')
+    const before = await this.snapshot(scope, { mode: 'planning' })
+    const after = clone(before)
+    const control = {}
+    let count = 0
+    if (enabled !== undefined) {
+      if (!subjectId) throw new Error('memory_subject_required')
+      const disabled = JSON.parse(before.meta.disabledSubjects || '{}')
+      if (enabled) delete disabled[subjectId]; else disabled[subjectId] = true
+      control.disabledSubjects = JSON.stringify(disabled)
+    } else {
+      for (const bucket of ['facts', 'events']) for (const item of Object.values(after[bucket])) {
+        if (id && item.id !== id || subjectId && (item.type !== 'fact' || item.subjectId !== String(subjectId))) continue
+        if (item.status === 'active') count++
+        after.revisions[`${item.id}:${item.revision}`] = clone(item)
+        item.status = 'retracted'; item.revision++; item.updatedAt = Date.now(); item.updatedBy = String(actorId)
+        after.tombstones[item.slotKey] = { actorId, at: Date.now() }
+      }
+      for (const item of Object.values(after.review)) {
+        if (id && item.candidate.id !== id || subjectId && item.candidate.subjectId !== String(subjectId)) continue
+        item.status = 'rejected'
+        after.tombstones[item.candidate.fingerprint] = { actorId, at: Date.now() }
+      }
+      if (!id) {
+        const latest = (await this.sources.status(scope)).latest
+        if (subjectId) { const values = JSON.parse(before.meta.suppressedSubjects || '{}'); values[subjectId] = latest; control.suppressedSubjects = JSON.stringify(values) }
+        else control.suppressedThrough = String(latest)
+      }
+    }
+    await this.commit(scope, this.plan(before, after, { control, nextEpoch: Number(before.meta.epoch || 0) + 1 }))
+    return { cleared: count, deleted: count > 0, enabled }
+  }
+
+  async importLegacyCandidates(scope, records, importId) {
+    const before = await this.snapshot(scope, { mode: 'planning' })
+    const after = clone(before)
+    for (const record of records) {
+      if (!text(record.text, 10000)) throw new Error('memory_legacy_candidate_invalid')
+      const fingerprint = memoryHash([scope.root, record.subjectId || null, record.text])
+      const id = 'review_' + fingerprint
+      if (after.review[id] || after.tombstones[fingerprint]) continue
+      const evidenceId = 'evidence_' + fingerprint
+      after.evidence[evidenceId] = { id: evidenceId, sourceKind: 'legacy_memory', sourceKey: record.key, quote: record.text, text: record.text, senderId: record.subjectId || null, sentAt: null }
+      const candidate = { id: (record.subjectId ? 'fact_' : 'event_') + fingerprint, type: record.subjectId ? 'fact' : 'event',
+        subjectId: record.subjectId || null, kind: 'identity', slot: 'legacy:' + fingerprint, value: record.text,
+        title: '旧群资料待核对', text: record.text, time: { start: null, precision: 'unknown' }, participants: [], lifecycle: 'unknown',
+        status: 'active', core: !!record.subjectId, basis: 'legacy_unverified', evidenceIds: [evidenceId], fingerprint, revision: 1, updatedAt: Date.now(), lastSupportedAt: null }
+      candidate.slotKey = identity(candidate)
+      after.review[id] = { id, candidate, evidenceIds: [evidenceId], reason: 'legacy_without_original_evidence', status: 'pending', targetId: null, targetRevision: 0 }
+    }
+    return this.commit(scope, this.plan(before, after, { id: 'import_' + importId, receipt: { id: importId, importedCandidates: records.length, committedAt: Date.now() } }))
   }
 
   reclaim(scope, { through = Number.MAX_SAFE_INTEGER, retain = 20 } = {}) {

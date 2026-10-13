@@ -7,18 +7,20 @@ if active then return cjson.encode({job=redis.call('HGET', KEYS[2], active), exi
 local cursor=tonumber(redis.call('HGET', KEYS[3], 'extractedThrough') or '0')
 local target=tonumber(redis.call('GET', KEYS[4]) or '0')
 if target<=cursor then return cjson.encode({empty=true}) end
-local job={id=ARGV[1], from=cursor+1, target=target, status='queued', createdAt=now, owner='', leaseUntil=0, batches=0, attempts=0}
+local job={id=ARGV[1], from=cursor+1, target=target, status='queued', createdAt=now, owner='', leaseUntil=0, batches=0, attempts=0,
+  startBatchCount=tonumber(redis.call('HGET', KEYS[3], 'committedBatchCount') or '0')}
 local encoded=cjson.encode(job)
 redis.call('HSET', KEYS[2], job.id, encoded); redis.call('SET', KEYS[1], job.id)
 return cjson.encode({job=encoded, existing=false})`
 
-const GET = `local id=ARGV[1] ~= '' and ARGV[1] or redis.call('GET', KEYS[1])
+const GET = `local id=ARGV[1] ~= '' and ARGV[1] or redis.call('GET', KEYS[1]) or redis.call('HGET', KEYS[3], 'lastJobId')
 return cjson.encode({job=id and redis.call('HGET', KEYS[2], id) or false})`
 
 const CLAIM = `${CLOCK}
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then return cjson.encode({error='memory_job_inactive'}) end
 local job=cjson.decode(redis.call('HGET', KEYS[2], ARGV[1]))
 if job.status=='running' and job.leaseUntil>now and job.owner~=ARGV[2] then return cjson.encode({busy=true, retryAt=job.leaseUntil}) end
+if job.status=='failed' or job.status=='paused' then job.attempts=0 end
 job.owner=ARGV[2]; job.status='running'; job.leaseUntil=now+tonumber(ARGV[3]); job.heartbeatAt=now
 redis.call('HSET', KEYS[3], 'workerToken', job.owner)
 local encoded=cjson.encode(job); redis.call('HSET', KEYS[2], job.id, encoded)
@@ -32,7 +34,7 @@ local patch=cjson.decode(ARGV[3]); for key,value in pairs(patch) do job[key]=val
 job.heartbeatAt=now; job.leaseUntil=now+tonumber(ARGV[4])
 if job.status~='running' then job.leaseUntil=0; redis.call('HSET', KEYS[3], 'workerToken', ARGV[2] .. ':stopped') end
 local encoded=cjson.encode(job); redis.call('HSET', KEYS[2], job.id, encoded)
-if job.status=='complete' then redis.call('DEL', KEYS[1]) end
+if job.status=='complete' then redis.call('HSET', KEYS[3], 'lastJobId', job.id); redis.call('DEL', KEYS[1]) end
 return cjson.encode({job=encoded})`
 
 export class MemoryJobs {

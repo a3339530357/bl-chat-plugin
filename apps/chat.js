@@ -1018,30 +1018,15 @@ ${v1Participants}` : '') })
   }
 
   /**
-   * 异步更新情感系统和关系分；用户/群记忆由全局消息记录器处理
+   * 异步更新情感系统；长期记忆仅由独立整理服务处理
    */
   async updateEnhancedSystems(e, userMessage, botReply) {
-    const { group_id: groupId, user_id: userId } = e
-    let emotionState = null
+    const { group_id: groupId } = e
 
     // 1. 更新情感系统
     if (this.config.emotionSystem?.enabled) {
       const isAtBot = e.message?.some(m => m.type === 'at' && m.qq === Bot.uin)
-      emotionState = await this.emotionManager.updateEmotionFromMessage(groupId, userMessage, isAtBot)
-    }
-
-    // 2. 更新关系分。用户记忆和群记忆都由全局消息记录器统一入队，
-    // 覆盖机器人未回复的真实群消息，并避免在回复路径重复抽取。
-    if (this.config.memorySystem?.enabled) {
-      const latestEmotionEvent = emotionState?.recentEvents?.[0]
-      if (latestEmotionEvent && Number.isFinite(latestEmotionEvent.delta)) {
-        const relationDelta = Math.max(-0.03, Math.min(0.03, latestEmotionEvent.delta * 0.2))
-        if (relationDelta !== 0) {
-          this.memoryManager.updateRelationship(groupId, userId, relationDelta).catch(err => {
-            logger.error('[MemoryManager] 根据情绪更新关系分失败:', err)
-          })
-        }
-      }
+      await this.emotionManager.updateEmotionFromMessage(groupId, userMessage, isAtBot)
     }
 
     // 表达学习已移至 handleRandomReply 静默收集，不在此处调用

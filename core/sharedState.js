@@ -1,5 +1,5 @@
 import { EmotionManager } from "../utils/EmotionManager.js"
-import { MemoryManager } from "../utils/MemoryManager.js"
+import { MemoryAdminV3 } from "../utils/memory/MemoryAdminV3.js"
 import { MemoryService } from "../utils/memory/MemoryService.js"
 import { ExpressionLearner } from "../utils/ExpressionLearner.js"
 import KnowledgeSearcher from "../functions/KnowledgeSearcher.js"
@@ -38,21 +38,6 @@ export async function refreshLocalTools(state, options = {}) {
   return applyToolRegistrySnapshot(state, snapshot)
 }
 
-export function buildMemoryConfig(config) {
-  const memorySystem = config.memorySystem || {}
-  return {
-    ...memorySystem,
-    automaticExtraction: false,
-    memoryAiConfig: config.memoryAiConfig || null,
-    embeddingAiConfig: config.embeddingAiConfig || null,
-    pluginEnabled: config.enabled !== false,
-    enableGroupWhitelist: Boolean(config.enableGroupWhitelist),
-    allowedGroups: Array.isArray(config.allowedGroups) ? config.allowedGroups : [],
-    groupExtractMinIntervalMinutes:
-      memorySystem.groupExtractMinIntervalMinutes ?? memorySystem.groupExtractMinInterval ?? 10
-  }
-}
-
 export function initializeSharedState(config) {
   if (sharedState) {
     sharedState.config = config
@@ -64,7 +49,7 @@ export function initializeSharedState(config) {
     // this.config 现读，initConfig 重载后自然生效，无需在此登记。
     // - messageManager：groupMaxMessages / groupChatMemoryDays
     // - emotionManager：decayRate / eventWeights
-    // - memoryManager：memorySystem 全量 + memoryAiConfig / embeddingAiConfig（updateConfig）
+    // - memoryService：memoryV3 / memoryAiConfig（updateConfig），旧字段只作兼容保留
     // - expressionLearner：expressionLearning 全量 + memoryAiConfig
     // - knowledgeSearcher：启用/停用/embedding 参数/topN/threshold
     // - 本地工具注册表：force reload
@@ -81,7 +66,6 @@ export function initializeSharedState(config) {
         ...config.emotionSystem?.eventWeights
       }
     })
-    sharedState.memoryManager.updateConfig(buildMemoryConfig(config))
     sharedState.memoryService.updateConfig(config)
     sharedState.memoryService.resumeAll().catch(error => logger.error(`[MemoryV3] 恢复任务失败: ${error.message}`))
     Object.assign(sharedState.expressionLearner.config, {
@@ -124,7 +108,6 @@ export function initializeSharedState(config) {
     // 情感系统
     emotionManager: new EmotionManager(config.emotionSystem || {}),
     // 长期记忆
-    memoryManager: new MemoryManager(buildMemoryConfig(config)),
     memoryService: new MemoryService(config),
     // 表达学习
     expressionLearner: new ExpressionLearner({
@@ -146,6 +129,7 @@ export function initializeSharedState(config) {
   }
 
   sharedState.messageManager.promptCacheConfig = config
+  sharedState.memoryManager = new MemoryAdminV3(sharedState.memoryService)
   sharedState.memoryStoreV3 = sharedState.memoryService.store
   sharedState.memoryService.resumeAll().catch(error => logger.error(`[MemoryV3] 恢复任务失败: ${error.message}`))
   applyToolRegistrySnapshot(sharedState)

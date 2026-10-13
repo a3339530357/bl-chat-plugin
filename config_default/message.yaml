@@ -267,7 +267,7 @@ pluginSettings:
     retryDelayMs: 1000
     coreTokens: 4000
     eventTokens: 1600
-    reclaimEnabled: false
+    reclaimEnabled: true
   memorySource:
     enabled: true
     remindMessages: 10000

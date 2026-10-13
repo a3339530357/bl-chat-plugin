@@ -11,7 +11,7 @@ function formatTime(value) {
 export function memorySourceStatusLines(status) {
   const { meta, snapshot } = status
   return [
-    `记忆原料：待整理 ${status.pending} 条，${Number(meta.pendingBytes || 0)} 字节（未整理原料永久保留）`,
+    `记忆原料：待整理 ${status.pending} 条，${Number(meta.sourcePendingBytes ?? meta.pendingBytes ?? 0)} 字节（未整理原料永久保留）；驻留原料 ${Number(meta.pendingBytes || 0)} 字节`,
     `保护起点：${formatTime(meta.captureStartedAt)}；最早积压：${formatTime(meta.oldestPendingAt)}`,
     `原料序号：${status.latest}；已整理至：${meta.extractedThrough || 0}；整理需主人手动触发，旧自动提取已停用`,
     `旧历史保全：${snapshot.importedAt ? '已导入可用原料' : snapshot.status || '尚未建立快照'}；raw 范围 ${snapshot.rawFrom || '-'}..${snapshot.rawUntil || '-'}（保全 ${snapshot.rawCaptured || 0} 条）；近期消息 ${snapshot.recentCount || 0} 条；回放 ${snapshot.replayCaptured || 0}/${snapshot.replayCount || 0}`,

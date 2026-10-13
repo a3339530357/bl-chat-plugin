@@ -24,10 +24,11 @@ export class MemoryRetrieverV3 {
     const revision = snapshot.meta.memoryRevision || '0'
     const previous = this.coreCache.get(scope.root)
     if (previous?.revision === revision) return previous
-    const facts = Object.values(snapshot.facts).filter(item => item.status === 'active' && item.core)
+    const disabled = JSON.parse(snapshot.meta.disabledSubjects || '{}')
+    const facts = Object.values(snapshot.facts).filter(item => item.status === 'active' && item.core && !disabled[item.subjectId])
       .sort((a, b) => a.subjectId.localeCompare(b.subjectId, 'en', { numeric: true }) || a.slot.localeCompare(b.slot) || a.id.localeCompare(b.id))
     const lines = facts.map(item => {
-      const name = item.evidenceIds.map(id => snapshot.evidence[id]).find(row => row?.senderId === item.subjectId)?.senderNameAtTime
+      const name = item.subjectName || item.evidenceIds.map(id => snapshot.evidence[id]).find(row => row?.senderId === item.subjectId)?.senderNameAtTime
       return `- [${item.id}] ${escape(name || '成员')}（QQ ${escape(item.subjectId)}）：${escape(item.text)}`
     })
     const value = { revision, lines, tokens: tokenEstimate(lines.join('\n')), count: facts.length }
@@ -39,6 +40,9 @@ export class MemoryRetrieverV3 {
   retrieveEvents(snapshot, query = {}, { now = Date.now() } = {}) {
     const { current, currentWords, recentWords, years } = queryParts(query, now)
     const names = new Map()
+    const addName = (name, id) => { if (name && id) { const ids = names.get(name) || new Set(); ids.add(id); names.set(name, ids) } }
+    for (const item of Object.values(snapshot.facts)) for (const name of item.aliases || []) addName(name, item.subjectId)
+    for (const event of Object.values(snapshot.events)) for (const [id, aliases] of Object.entries(event.participantNames || {})) for (const name of aliases) addName(name, id)
     for (const row of Object.values(snapshot.evidence)) {
       if (!row.senderNameAtTime || !row.senderId) continue
       const ids = names.get(row.senderNameAtTime) || new Set()
@@ -51,12 +55,14 @@ export class MemoryRetrieverV3 {
     for (const event of Object.values(snapshot.events)) {
       if (event.status !== 'active') continue
       const year = event.time?.start?.slice(0, 4)
-      if (years.length && year && !years.includes(year)) continue
+      const endYear = event.time?.end?.slice(0, 4) || year
+      const matchesYear = year && years.some(value => value >= year && value <= endYear)
+      if (years.length && year && !matchesYear) continue
       const words = keywordSet([event.title, event.text, ...(event.tags || []), ...(event.aliases || [])].join(' '))
       const currentHits = [...currentWords].filter(word => words.has(word)).length
       const recentHits = [...recentWords].filter(word => words.has(word)).length
       const personHit = event.participants.some(id => people.has(id))
-      const dateHit = years.length && years.includes(year)
+      const dateHit = years.length && matchesYear
       const contextual = /上次|那个|那天|之前|他|她/.test(current) && recentHits >= 2
       if (!currentHits && !personHit && !dateHit && !contextual) continue
       const score = currentHits * 2 + (personHit ? 6 : 0) + (dateHit ? 5 : 0) + (contextual ? Math.min(recentHits, 4) : 0)
@@ -69,7 +75,7 @@ export class MemoryRetrieverV3 {
   async buildMemoryTail({ botId, groupId, queryContext = {}, now = Date.now() }) {
     const scope = this.store.scope(botId, groupId)
     try {
-      const snapshot = await this.store.snapshot(scope)
+      const snapshot = await this.store.snapshot(scope, { mode: 'recall' })
       const core = this.core(scope, snapshot)
       const settings = memoryV3Settings(this.config)
       if (core.tokens > settings.coreTokens) {
@@ -79,7 +85,7 @@ export class MemoryRetrieverV3 {
       const events = []
       let eventTokens = 0
       for (const { event } of this.retrieveEvents(snapshot, queryContext, { now })) {
-        const line = `- [${event.id}] ${event.time?.start || '日期不明'}（${event.time?.precision || 'unknown'}）：${escape(event.text)}；${lifecycleLabels[event.lifecycle]}；参与QQ：${event.participants.map(escape).join('、') || '不明'}`
+        const line = `- [${event.id}] ${event.time?.start || '日期不明'}${event.time?.end ? `～${event.time.end}` : ''}（${event.time?.precision || 'unknown'}）：${escape(event.text)}；${lifecycleLabels[event.lifecycle]}；参与QQ：${event.participants.map(escape).join('、') || '不明'}`
         const size = tokenEstimate(line)
         if (eventTokens + size > settings.eventTokens) continue
         events.push(line); eventTokens += size

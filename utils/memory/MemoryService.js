@@ -5,6 +5,7 @@ import { MemoryExtractorV3, memoryV3Settings, memoryV3Enabled } from './MemoryEx
 import { MemoryJobs } from './MemoryJobs.js'
 import { tokenEstimate } from '../../core/promptCache.js'
 import { MemoryRetrieverV3 } from './MemoryRetrieverV3.js'
+import { MemoryLegacyImporter } from './MemoryLegacyImporter.js'
 
 let extractionQueue = Promise.resolve()
 
@@ -15,6 +16,7 @@ export class MemoryService {
     this.jobs = new MemoryJobs(store)
     this.extractor = new MemoryExtractorV3(config, model)
     this.retriever = new MemoryRetrieverV3(store, config)
+    this.importer = new MemoryLegacyImporter(store)
     this.running = new Map()
     this.controllers = new Map()
     this.recoveryTimers = new Map()
@@ -62,18 +64,30 @@ export class MemoryService {
 
   async requestPart(scope, input) {
     const settings = memoryV3Settings(this.config)
+    const state = await this.store.snapshot(scope, { mode: 'planning' })
+    const disabled = JSON.parse(state.meta.disabledSubjects || '{}')
+    const suppressed = JSON.parse(state.meta.suppressedSubjects || '{}')
+    const visible = row => !disabled[row.senderId] && row.memorySeq > Math.max(Number(state.meta.suppressedThrough || 0), Number(suppressed[row.senderId] || 0))
+    input = { ...input, messages: input.messages.filter(visible), context: input.context.filter(visible),
+      existing: { facts: (input.existing.facts || []).filter(item => !disabled[item.subjectId] && state.facts[item.id]?.status === 'active')
+        .map(item => ({ ...item, text: state.facts[item.id].text, value: state.facts[item.id].value, revision: state.facts[item.id].revision })),
+      events: (input.existing.events || []).filter(item => state.events[item.id]?.status === 'active') } }
+    if (!this.enabled(scope)) throw new Error('memory_organizing_disabled')
+    if (!input.messages.length) return { candidates: [], audit: { excludedSources: true, candidateCount: 0, verdicts: [] } }
     const controller = new AbortController()
     this.controllers.set(scope.root, { scope, controller })
+    const startedAt = Date.now()
     let timer
     try {
       return await Promise.race([
         this.extractor.extractPart(input, controller.signal),
         new Promise((_, reject) => {
           controller.signal.addEventListener('abort', () => reject(new Error('memory_request_aborted')), { once: true })
+          if (controller.signal.aborted) reject(new Error('memory_request_aborted'))
           timer = setTimeout(() => controller.abort(), settings.timeoutMs)
         })
       ])
-    } finally { clearTimeout(timer); this.controllers.delete(scope.root) }
+    } finally { clearTimeout(timer); this.controllers.delete(scope.root); this.lastModelMs = Date.now() - startedAt }
   }
 
   async buildBatch(scope, job, state) {
@@ -113,7 +127,28 @@ export class MemoryService {
     if (rows.length === 1 && rows[0].text.length > chunkSize) {
       for (let offset = 0; offset < rows[0].text.length; offset += chunkSize) parts.push({ messages: [{ ...project(rows[0]), text: rows[0].text.slice(offset, offset + chunkSize) }], fragment: { offset, total: rows[0].text.length } })
     } else parts.push({ messages: rows.map(project), fragment: null })
+    if (parts.length > 128) throw new Error('memory_batch_oversize')
     return { from: after + 1, to: rows.at(-1).memorySeq, sourceHash: memoryHash(rows), extractorVersion: 'v3.1', parts, context, existing, nextPart: 0, candidates: [], audits: [] }
+  }
+
+  splitPart(batch) {
+    const parent = batch.parts[batch.nextPart]
+    if (!parent || batch.parts.length >= 128) return false
+    let children
+    if (parent.messages.length > 1) {
+      const middle = Math.ceil(parent.messages.length / 2)
+      children = [parent.messages.slice(0, middle), parent.messages.slice(middle)].map(messages => ({ messages, fragment: parent.fragment }))
+    } else if (parent.messages[0]?.text.length > 128) {
+      const row = parent.messages[0]
+      let middle = Math.floor(row.text.length / 2)
+      if (/[\uD800-\uDBFF]/.test(row.text[middle - 1])) middle--
+      children = [0, middle].map((offset, index) => ({ messages: [{ ...row, text: row.text.slice(offset, index === 0 ? middle : undefined) }],
+        fragment: { offset: (parent.fragment?.offset || 0) + offset, total: parent.fragment?.total || row.text.length } }))
+    } else return false
+    batch.splitHistory ||= []
+    batch.splitHistory.push({ parent: memoryHash(parent), children: children.map(memoryHash), reason: 'truncated', from: batch.from, to: batch.to })
+    batch.parts.splice(batch.nextPart, 1, ...children)
+    return true
   }
 
   async run(scope, id) {
@@ -133,10 +168,11 @@ export class MemoryService {
     heartbeat.unref?.()
     try {
       while (this.enabled(scope)) {
-        const state = await this.store.snapshot(scope)
+        const state = await this.store.snapshot(scope, { mode: 'planning' })
         if (Number(state.meta.extractedThrough || 0) >= job.target) {
-          const batches = Object.values(state.batches).filter(batch => batch.from >= job.from && batch.to <= job.target).length
-          await this.jobs.update(scope, id, token, { status: 'complete', finishedAt: Date.now(), batch: null, batches }, 0)
+          if (memoryV3Settings(this.config).reclaimEnabled) while (!(await this.store.reclaim(scope)).done) await yieldLoop()
+          const batches = Number(state.meta.committedBatchCount || 0) - Number(job.startBatchCount || 0)
+          await this.jobs.update(scope, id, token, { status: 'complete', finishedAt: Date.now(), elapsedMs: Date.now() - job.createdAt, lastModelMs: this.lastModelMs || 0, batch: null, batches }, 0)
           return
         }
         let batch = job.batch
@@ -155,16 +191,18 @@ export class MemoryService {
             await yieldLoop()
           }
           if (!this.enabled(scope)) throw new Error('memory_organizing_disabled')
-          const plan = await this.store.planBatch(scope, { ...batch, token, audit: { sourceHash: batch.sourceHash, parts: batch.audits, model: this.config.memoryAiConfig?.memoryAiModel || 'injected' } })
+          const plan = await this.store.planBatch(scope, { ...batch, token, audit: { sourceHash: batch.sourceHash, parts: batch.audits, splits: batch.splitHistory || [], model: this.config.memoryAiConfig?.memoryAiModel || 'injected' } })
           const result = await this.store.commit(scope, plan)
           job = (await this.jobs.update(scope, id, token, { batch: null, batches: job.batches + 1, lastReceipt: result.batch, attempts: 0 }, leaseMs)).job
         } catch (error) {
           const attempts = Number(job.attempts || 0) + 1
           if (!this.enabled(scope)) throw error
-          if (/memory_conflict/.test(error.message) && attempts < memoryV3Settings(this.config).maxAttempts) {
+          if (error.message === 'memory_model_truncated' && this.splitPart(batch)) {
+            job = (await this.jobs.update(scope, id, token, { attempts: 0, batch, lastError: error.message }, leaseMs)).job
+          } else if (/memory_conflict/.test(error.message) && attempts < memoryV3Settings(this.config).maxAttempts) {
             job = (await this.jobs.update(scope, id, token, { attempts }, leaseMs)).job
           } else if (attempts < memoryV3Settings(this.config).maxAttempts && /model|verifier|request|429|timeout/i.test(error.message)) {
-            job = (await this.jobs.update(scope, id, token, { attempts, lastError: error.message, batch }, leaseMs)).job
+            job = (await this.jobs.update(scope, id, token, { attempts, retryCount: Number(job.retryCount || 0) + 1, lastError: error.message, batch }, leaseMs)).job
             await delay(Math.min(60000, memoryV3Settings(this.config).retryDelayMs * 2 ** (attempts - 1)))
           } else throw error
         }

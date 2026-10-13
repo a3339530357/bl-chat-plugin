@@ -1,4 +1,4 @@
-export default [
+const legacyFields = [
   {
     component: "SOFT_GROUP_BEGIN",
     label: "长期记忆系统 (memorySystem)"
@@ -99,4 +99,18 @@ export default [
     bottomHelpMessage: "仅在开启语义召回时生效，先筛选多少条候选记忆",
     componentProps: { min: 1, max: 100, placeholder: "20" }
   }
+]
+
+
+export default [
+  { component: 'SOFT_GROUP_BEGIN', label: '长期记忆 V3' },
+  { field: 'memoryV3.enabled', label: '长期记忆 V3', component: 'Switch', bottomHelpMessage: '关闭整理和注入，不删除已保护数据，不重新开启旧自动提取' },
+  { field: 'memoryV3.groups', label: '启用记忆的群', component: 'GTags', componentProps: { allowAdd: true, allowDel: true }, bottomHelpMessage: '填群号；未配置时沿用原料采集群，显式空列表表示不启用任何群' },
+  { field: 'memoryV3.organizeEnabled', label: '允许主人整理', component: 'Switch', bottomHelpMessage: '主人发送 #整理记忆 才启动；关闭会暂停任务，原料仍保留' },
+  { field: 'memoryV3.injectEnabled', label: '对话使用长期记忆', component: 'Switch', bottomHelpMessage: '核心事实与相关群事件仅作为本轮尾部资料' },
+  { field: 'memoryV3.reclaimEnabled', label: '回收已整理原料', component: 'Switch', bottomHelpMessage: '只回收已成功提交且证据已另存的原料，保留末尾20条语境；未整理原料不删除' },
+  { field: 'memoryV3.coreTokens', label: '核心事实预算', component: 'InputNumber', componentProps: { min: 64, max: 16000 }, bottomHelpMessage: '超限会在记忆状态中显示，需精简核心事实；不会静默截断' },
+  { field: 'memorySource.enabled', label: '保全记忆原料', component: 'Switch', bottomHelpMessage: '独立于整理、注入和模型配置；关闭停止新采集，不删除已保全数据' },
+  { field: 'memorySource.groups', label: '保全原料的群', component: 'GTags', componentProps: { allowAdd: true, allowDel: true }, bottomHelpMessage: '未配置时沿用 promptCache.groups；显式空列表不采集任何群' },
+  ...legacyFields.map(field => ({ ...field, label: field.field ? `${field.label}（旧字段）` : '旧记忆兼容配置', bottomHelpMessage: '兼容保留；V3不使用此字段，旧自动提取和旧召回已退役' }))
 ]

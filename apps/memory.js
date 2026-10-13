@@ -3,6 +3,7 @@ import common from "../../../lib/common/common.js"
 import { memorySourceStore } from "../utils/memory/MemorySourceStore.js"
 import { memorySourceStatusLines } from "../utils/memory/sourceStatus.js"
 import { botIdForEvent } from "../core/promptCache.js"
+import { MemoryAdminV3 } from "../utils/memory/MemoryAdminV3.js"
 import { memoryStoreV3 } from "../utils/memory/MemoryStoreV3.js"
 
 /**
@@ -20,6 +21,7 @@ export class MemoryCommands extends plugin {
       event: "message",
       priority: 9998,
       rule: [
+        { reg: "^#导入历史记忆$", fnc: "importV3", permission: "master" },
         { reg: "^#整理记忆$", fnc: "organizeV3", permission: "master" },
         { reg: "^#整理记忆进度$", fnc: "organizeV3Status", permission: "master" },
         { reg: "^#记忆(待确认|证据|确认|驳回|修正|撤销修订|删除条目)(?:\\s+[\\s\\S]+)?$", fnc: "manageV3", permission: "master" },
@@ -41,6 +43,24 @@ export class MemoryCommands extends plugin {
     return getSharedState()?.memoryManager
   }
 
+  managerFor(e) {
+    const service = getSharedState()?.memoryService
+    return service ? new MemoryAdminV3(service, e) : this.memoryManager
+  }
+
+  async importV3(e) {
+    if (!e.isMaster || !e.group_id) { await e.reply('请由主人在目标群使用此命令'); return true }
+    const service = getSharedState()?.memoryService
+    if (!service) { await e.reply('记忆服务尚未就绪'); return true }
+    const scope = service.store.scope(botIdForEvent(e), e.group_id)
+    const task = service.importer.import(scope)
+    task.then(result => e.reply(`历史导入完成：新增原料 ${result.imported} 条，已覆盖 ${result.duplicate} 条，旧记忆待确认 ${result.reviews} 条。${result.coverage.gap ? `原快照有缺口：${result.coverage.gap}。` : ''}可发送 #整理记忆 处理新增原料。`))
+      .catch(error => { logger.error(`[MemoryV3] 历史导入失败: ${error.message}`); return e.reply(`历史导入失败：${error.message}，已保全数据仍在，可重试。`) })
+      .catch(error => logger.error(`[MemoryV3] 导入结果通知失败: ${error.message}`))
+    await e.reply('已开始后台导入当前群的已保全历史；不会自动调用提取模型。')
+    return true
+  }
+
   async organizeV3(e) {
     if (!e.isMaster || !e.group_id) { await e.reply('请由主人在目标群使用此命令'); return true }
     try {
@@ -59,7 +79,7 @@ export class MemoryCommands extends plugin {
       const scope = service.store.scope(botIdForEvent(e), e.group_id)
       const { job } = await service.jobs.get(scope)
       const state = await service.store.snapshot(scope)
-      await e.reply(`整理进度：${state.meta.extractedThrough || 0}\n${job ? `任务 ${job.id}：${job.status}，截止 ${job.target}，已提交 ${job.batches} 批${job.lastError ? `，最近错误 ${job.lastError}` : ''}` : '当前没有待执行任务'}`)
+      await e.reply(`整理进度：${state.meta.extractedThrough || 0}\n${job ? `任务 ${job.id}：${job.status}，截止 ${job.target}，已提交 ${job.batches} 批，重试 ${job.retryCount || 0} 次${job.elapsedMs != null ? `，耗时 ${job.elapsedMs}ms` : ''}${job.lastError ? `，最近错误 ${job.lastError}` : ''}` : '当前没有待执行任务'}`)
     } catch (error) { await e.reply(`读取整理进度失败：${error.message}`) }
     return true
   }
@@ -98,7 +118,7 @@ export class MemoryCommands extends plugin {
 
   formatMemoryFactLines(facts = []) {
     return facts.map(fact => {
-      const shortId = String(fact.id).slice(0, 8)
+      const shortId = String(fact.id)
       const score = Number(fact.score ?? fact.importance ?? 0).toFixed(2)
       return `ID:${shortId} [${fact.category}] ${fact.content} (${score})`
     })
@@ -141,11 +161,16 @@ export class MemoryCommands extends plugin {
 
   async memoryStatus(e) {
     try {
-      const status = await this.memoryManager.adminStatus({
+      const status = await this.managerFor(e).adminStatus({
         groupId: e.group_id,
         userId: e.user_id
       })
-      const lines = [
+      const lines = status.v3 ? [
+        `记忆 V3：${status.enabled ? "开启" : "关闭"}，版本 ${status.revision}`,
+        `主人整理：${status.organizeEnabled ? "允许" : "暂停"}；对话注入：${status.injectEnabled ? "开启" : "关闭"}`,
+        `个人事实：${status.user.factCount} 条（${status.user.disabled ? "已禁用" : "启用"}）；群事件：${status.group.factCount} 条`,
+        `待主人确认：${status.pendingReviews} 条；整理仅由主人命令触发`
+      ] : [
         `记忆系统：${status.enabled ? "开启" : "关闭"}`,
         `用户记忆：${status.user?.disabled ? "已禁用" : "启用"}，${status.user?.factCount || 0} 条，关系分 ${Number(status.user?.relationshipScore ?? 0.5).toFixed(2)}`,
         `群记忆：${status.group?.disabled ? "已禁用" : "启用"}，${status.group?.factCount || 0} 条`,
@@ -158,7 +183,7 @@ export class MemoryCommands extends plugin {
           lines.push(...memorySourceStatusLines(await memorySourceStore.status(memorySourceStore.scope(botIdForEvent(e), e.group_id))))
           const service = getSharedState()?.memoryService
           const diagnostic = service?.retriever.status.get(memorySourceStore.scope(botIdForEvent(e), e.group_id).root)
-          if (diagnostic) lines.push(`本轮记忆召回状态：${diagnostic.state}；核心 ${diagnostic.coreTokens || 0} token${diagnostic.budget ? ` / 预算 ${diagnostic.budget}` : ''}`)
+          if (diagnostic) lines.push(`最近记忆召回状态：${diagnostic.state}；核心 ${diagnostic.coreTokens || 0} token${diagnostic.budget ? ` / 预算 ${diagnostic.budget}` : ''}`)
         } catch (error) {
           lines.push("记忆原料状态读取失败，旧记忆状态如上")
           logger.warn(`[MemorySource] 状态读取失败: ${error.message}`)
@@ -174,7 +199,7 @@ export class MemoryCommands extends plugin {
 
   async listMyMemory(e) {
     try {
-      const result = await this.memoryManager.adminListMemories({
+      const result = await this.managerFor(e).adminListMemories({
         scope: "user",
         groupId: e.group_id,
         userId: e.user_id,
@@ -197,7 +222,7 @@ export class MemoryCommands extends plugin {
     }
 
     try {
-      const result = await this.memoryManager.adminListMemories({
+      const result = await this.managerFor(e).adminListMemories({
         scope: "group",
         groupId: e.group_id,
         limit: 30
@@ -220,7 +245,7 @@ export class MemoryCommands extends plugin {
     }
 
     try {
-      const myResult = await this.memoryManager.adminListMemories({
+      const myResult = await this.managerFor(e).adminListMemories({
         scope: "user",
         groupId: e.group_id,
         userId: e.user_id,
@@ -228,7 +253,7 @@ export class MemoryCommands extends plugin {
         limit: 10
       })
       const groupResult = e.group_id
-        ? await this.memoryManager.adminListMemories({
+        ? await this.managerFor(e).adminListMemories({
             scope: "group",
             groupId: e.group_id,
             query,
@@ -254,7 +279,7 @@ export class MemoryCommands extends plugin {
     }
 
     try {
-      let result = await this.memoryManager.adminDeleteMemory({
+      let result = await this.managerFor(e).adminDeleteMemory({
         scope: "user",
         groupId: e.group_id,
         userId: e.user_id,
@@ -262,7 +287,7 @@ export class MemoryCommands extends plugin {
       })
 
       if (!result.deleted && this.isGroupMemoryAdmin(e)) {
-        result = await this.memoryManager.adminDeleteMemory({
+        result = await this.managerFor(e).adminDeleteMemory({
           scope: "group",
           groupId: e.group_id,
           id
@@ -286,7 +311,7 @@ export class MemoryCommands extends plugin {
 
   async clearMyMemory(e) {
     try {
-      const result = await this.memoryManager.adminClearMemories({
+      const result = await this.managerFor(e).adminClearMemories({
         scope: "user",
         groupId: e.group_id,
         userId: e.user_id
@@ -304,13 +329,13 @@ export class MemoryCommands extends plugin {
       await e.reply("请在群聊中使用这个命令")
       return true
     }
-    if (!this.isGroupMemoryAdmin(e)) {
-      await e.reply("只有群主、管理员或主人可以清空群记忆")
+    if (!e.isMaster) {
+      await e.reply("只有主人可以清空群记忆")
       return true
     }
 
     try {
-      const result = await this.memoryManager.adminClearMemories({
+      const result = await this.managerFor(e).adminClearMemories({
         scope: "group",
         groupId: e.group_id
       })
@@ -324,7 +349,7 @@ export class MemoryCommands extends plugin {
 
   async disableMyMemory(e) {
     try {
-      await this.memoryManager.adminSetUserMemoryEnabled({
+      await this.managerFor(e).adminSetUserMemoryEnabled({
         groupId: e.group_id,
         userId: e.user_id,
         enabled: false
@@ -339,7 +364,7 @@ export class MemoryCommands extends plugin {
 
   async enableMyMemory(e) {
     try {
-      await this.memoryManager.adminSetUserMemoryEnabled({
+      await this.managerFor(e).adminSetUserMemoryEnabled({
         groupId: e.group_id,
         userId: e.user_id,
         enabled: true

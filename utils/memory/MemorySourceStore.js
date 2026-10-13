@@ -17,8 +17,11 @@ local function prepareMemory(keys, payload, ledgerSeq, resetId)
   local byteText = redis.call('HGET', keys[4], 'pendingBytes') or '0'
   local bytes = tonumber(byteText)
   local cursor = tonumber(redis.call('HGET', keys[4], 'sourceReclaimedThrough') or '0')
+  local backlogText = redis.call('HGET', keys[4], 'sourcePendingBytes') or byteText
+  local backlog = tonumber(backlogText)
   if not latest or latest < 0 or latest % 1 ~= 0 or latest >= 9007199254740990 or not bytes or bytes < 0 or bytes % 1 ~= 0 then return nil, 'memory_source_gap' end
   if byteText ~= string.format('%.0f', bytes) then return nil, 'memory_source_gap' end
+  if not backlog or backlog < 0 or backlogText ~= string.format('%.0f', backlog) then return nil, 'memory_source_gap' end
   if redis.call('HLEN', keys[3]) ~= latest then return nil, 'memory_source_gap' end
   if latest > 0 and redis.call('HEXISTS', keys[4], 'pendingBytes') == 0 then return nil, 'memory_source_gap' end
   if not cursor or cursor < 0 or cursor > latest or cursor % 1 ~= 0 or redis.call('ZCARD', keys[2]) ~= latest-cursor then return nil, 'memory_source_gap' end
@@ -29,19 +32,22 @@ local function prepareMemory(keys, payload, ledgerSeq, resetId)
     return {seq=previous, duplicate=true}, nil
   end
   local seq = latest + 1
-  local encoded = cjson.encode({memorySeq=seq, eventId=source.eventId, payload=payload,
+  local encoded = cjson.encode({memorySeq=seq, eventId=source.eventId, payload=payload, capturedAt=now,
     ledgerRef=ledgerSeq and {seq=ledgerSeq, resetId=resetId} or cjson.null})
   if bytes + string.len(encoded) >= 9007199254740990 then return nil, 'memory_source_gap' end
   return {seq=seq, encoded=encoded, eventId=source.eventId}, nil
 end
 local function appendMemory(keys, item, now)
   if item.duplicate then return end
+  redis.call('HSETNX', keys[4], 'sourcePendingBytes', redis.call('HGET', keys[4], 'pendingBytes') or '0')
   redis.call('SET', keys[1], item.seq)
   redis.call('ZADD', keys[2], item.seq, item.encoded)
   redis.call('HSET', keys[3], item.eventId, item.seq)
   redis.call('HINCRBY', keys[4], 'pendingBytes', string.len(item.encoded))
+  redis.call('HINCRBY', keys[4], 'sourcePendingBytes', string.len(item.encoded))
   redis.call('HSETNX', keys[4], 'captureStartedAt', now)
   redis.call('HSETNX', keys[4], 'oldestPendingAt', now)
+  if item.seq == tonumber(redis.call('HGET', keys[4], 'extractedThrough') or '0')+1 then redis.call('HSET', keys[4], 'oldestPendingAt', now) end
   redis.call('HSETNX', keys[4], 'extractedThrough', 0)
   redis.call('HSETNX', keys[4], 'memoryRevision', 0)
   redis.call('HSET', keys[4], 'lastCapturedAt', now)
@@ -63,7 +69,7 @@ const STATUS = `local meta = {}; local values = redis.call('HGETALL', KEYS[4])
 for i=1,#values,2 do meta[values[i]]=values[i+1] end
 local cursor = tonumber(meta.extractedThrough or '0')
 local first = redis.call('ZRANGEBYSCORE', KEYS[2], '(' .. cursor, '+inf', 'LIMIT', 0, 1)
-if #first > 0 then meta.oldestPendingAt = tostring(cjson.decode(cjson.decode(first[1]).payload).receivedAt or '') else meta.oldestPendingAt = '0' end
+if #first > 0 then local row=cjson.decode(first[1]); meta.oldestPendingAt=tostring(row.capturedAt or cjson.decode(row.payload).receivedAt or '') else meta.oldestPendingAt = '0' end
 return cjson.encode({latest=tonumber(redis.call('GET', KEYS[1]) or '0'), pending=redis.call('ZCOUNT', KEYS[2], '(' .. cursor, '+inf'), resident=redis.call('ZCARD', KEYS[2]), meta=meta})`
 
 const ERROR = `${CLOCK}
@@ -72,7 +78,7 @@ return cjson.encode({recorded=true})`
 
 const REMIND = `${CLOCK}
 local count = redis.call('ZCOUNT', KEYS[1], '(' .. (redis.call('HGET', KEYS[2], 'extractedThrough') or '0'), '+inf')
-local bytes = tonumber(redis.call('HGET', KEYS[2], 'pendingBytes') or '0')
+local bytes = tonumber(redis.call('HGET', KEYS[2], 'sourcePendingBytes') or redis.call('HGET', KEYS[2], 'pendingBytes') or '0')
 local oldest = tonumber(redis.call('HGET', KEYS[2], 'oldestPendingAt') or now)
 local previous = tonumber(redis.call('HGET', KEYS[2], 'remindedAt') or '0')
 if count == 0 or (count < tonumber(ARGV[1]) and bytes < tonumber(ARGV[2]) and now-oldest < tonumber(ARGV[3])) or now-previous < tonumber(ARGV[4]) then return cjson.encode({due=false}) end
